@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "0.1",
+  "updated": "2026-07-16",
+  "license": "CC-BY-NC-SA-4.0",
+  "attribution": "Distilled from nnInteractive (DKFZ), arXiv:2503.08373",
+  "_note": "Placeholder manifest. Weight URLs are filled in at M5 when variants are published to the CORS Ceph bucket. See ../docs/CAPABILITY-MANIFEST.md.",
+  "variants": [],
+  "servers": []
+}
