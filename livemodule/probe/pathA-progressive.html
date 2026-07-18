@@ -1,0 +1,180 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nnLive — Path A progressive (64→128→192) custom-WGSL</title>
+<style>
+  body{font:14px/1.5 system-ui,sans-serif;max-width:1080px;margin:1rem auto;padding:0 1rem;color:#111}
+  h1{font-size:1.2rem;margin:.2rem 0}
+  #sub{color:#444;min-height:1.4em}
+  .row{display:flex;gap:1.4rem;align-items:flex-start;flex-wrap:wrap}
+  canvas{image-rendering:pixelated;border:1px solid #bbb;border-radius:4px;background:#000;cursor:crosshair}
+  #log{white-space:pre-wrap;background:#f6f6f6;padding:8px 10px;border-radius:6px;font-family:ui-monospace,monospace;font-size:11.5px;max-height:64vh;overflow:auto;flex:1;min-width:260px}
+  button{font:inherit;padding:.25rem .7rem;border-radius:5px;border:1px solid #bbb;background:#fff;cursor:pointer}
+  .pass{color:#0a7d28;font-weight:600}.fail{color:#c0242b;font-weight:600}.run{color:#b26a00}
+  .tier{display:inline-block;padding:.05rem .4rem;border-radius:4px;margin-right:.3rem;font-size:12px}
+</style>
+<h1>nnLive — Path A · progressive 64→128→192 · custom WGSL</h1>
+<p id="sub">loading…</p>
+<p style="color:#555;margin:.2rem 0 .7rem">
+  <b>Left-click</b> = positive · <b>Shift/right-click</b> = negative · scroll/slider = slice.
+  Each click paints a <b>coarse 64³ result instantly</b>, then <b>refines at 128³</b> — a radial gauge at the click fills
+  as each tier lands. <b>192³ is a placeholder</b> until the multi-scale model finishes training. Tiers:
+  <span id="tiers"></span></p>
+<div class="row">
+  <div>
+    <canvas id="cv" width="480" height="480"></canvas>
+    <div style="margin-top:.4rem;display:flex;gap:.55rem;align-items:center;flex-wrap:wrap">
+      slice <input id="z" type="range" min="0" max="1" value="0" style="width:210px"> <span id="zv">0</span>
+      <button id="clear">clear</button>
+      <label><input id="ov" type="checkbox" checked> mask</label>
+      <label><input id="rf" type="checkbox"> IDC seg</label>
+      <label><input id="bx" type="checkbox" checked> box</label>
+    </div>
+  </div>
+  <div id="log"></div>
+</div>
+<script type="module">
+const $=id=>document.getElementById(id);
+const logEl=$('log'), sub=$('sub'), lines=[];
+const log=s=>{lines.push(s);logEl.textContent=lines.join('\n');logEl.scrollTop=logEl.scrollHeight;console.log(s)};
+const t0=performance.now(), clk=()=>((performance.now()-t0)/1000).toFixed(1)+'s';
+const AUTO=new URLSearchParams(location.search).has('auto');
+const RES=[64,128];                          // active tiers (both work today)
+const PLACEHOLDER=192;                        // shown but "coming"
+const ALL=[64,128,192];
+const COLOR={64:'#3b9dff',128:'#0a7d28',192:'#9aa0a6'};
+const ball=(r)=>{const o=[];for(let z=-r;z<=r;z++)for(let y=-r;y<=r;y++)for(let x=-r;x<=r;x++)if(x*x+y*y+z*z<=r*r)o.push([z,y,x]);return o;};
+const BALL3=ball(3);
+
+let Z,Y,X, ct,vol,lab=null, mask;
+let clicks=[], boxes={}, needEnc={}, ready=false, busy=false;
+let tier={64:'idle',128:'idle',192:'placeholder'};   // idle|computing|done|placeholder
+let lastXY=null, animating=false;
+const cv=$('cv'), cx=cv.getContext('2d');
+
+function tierBadges(){ $('tiers').innerHTML=ALL.map(p=>{
+  const st=tier[p], c={idle:'#eee',computing:'#ffe3b0',done:'#c9f0d0',placeholder:'#eee'}[st];
+  const t={idle:'·',computing:'…',done:'✓',placeholder:'soon'}[st];
+  return `<span class="tier" style="background:${c};color:${COLOR[p]}">${p}³ ${t}</span>`; }).join(''); }
+
+function draw(){
+  const z=+$('z').value; $('zv').textContent=z;
+  const img=cx.createImageData(X,Y), o=z*Y*X;
+  const showMask=$('ov').checked, showRef=$('rf').checked&&lab;
+  for(let i=0;i<X*Y;i++){ const g=ct[o+i]; let r=g,gr=g,b=g;
+    if(showRef&&lab[o+i]){ gr=(gr+150)>>1; }
+    if(showMask&&mask[o+i]){ r=(r+255)>>1; gr=gr>>1; b=b>>1; }
+    const p=i*4; img.data[p]=r; img.data[p+1]=gr; img.data[p+2]=b; img.data[p+3]=255; }
+  const tmp=new OffscreenCanvas(X,Y); tmp.getContext('2d').putImageData(img,0,0);
+  cx.imageSmoothingEnabled=false; cx.clearRect(0,0,cv.width,cv.height); cx.drawImage(tmp,0,0,cv.width,cv.height);
+  const sx=cv.width/X, sy=cv.height/Y;
+  if($('bx').checked) for(const P of RES){ const bx=boxes[P]; if(bx && z>=bx.z0 && z<bx.z0+P){
+    cx.strokeStyle=COLOR[P]+'88'; cx.lineWidth=1; cx.strokeRect(bx.x0*sx, bx.y0*sy, P*sx, P*sy); } }
+  for(const c of clicks){ if(c.z!==z) continue;
+    cx.strokeStyle=c.sign>0?'#00e0ff':'#ff3bd0'; cx.lineWidth=2;
+    const px=c.x*sx+sx/2, py=c.y*sy+sy/2;
+    cx.beginPath(); cx.moveTo(px-6,py); cx.lineTo(px+6,py); if(c.sign>0){cx.moveTo(px,py-6); cx.lineTo(px,py+6);} cx.stroke(); }
+  if(animating && lastXY) drawRadial(lastXY.x, lastXY.y);
+}
+
+// radial gauge: 3 wedges (64/128/192) that fill as tiers complete; current tier pulses
+function drawRadial(px,py){
+  const rO=26, rI=13, tnow=performance.now()/1000;
+  ALL.forEach((P,i)=>{ const a0=-Math.PI/2 + i*2*Math.PI/3, a1=a0+2*Math.PI/3-0.06;
+    const st=tier[P];
+    cx.beginPath(); cx.arc(px,py,rO,a0,a1); cx.arc(px,py,rI,a1,a0,true); cx.closePath();
+    if(st==='done'){ cx.fillStyle=COLOR[P]+'dd'; cx.fill(); }
+    else if(st==='computing'){ cx.fillStyle=COLOR[P]+(Math.floor((0.4+0.4*Math.abs(Math.sin(tnow*3)))*255)).toString(16).padStart(2,'0'); cx.fill(); }
+    else { cx.fillStyle='#00000022'; cx.fill(); cx.strokeStyle=(P===192?'#9aa0a6':'#ffffff66'); cx.lineWidth=1; if(P===192)cx.setLineDash([3,3]); cx.stroke(); cx.setLineDash([]); }
+  });
+  cx.beginPath(); cx.arc(px,py,rI-2,0,2*Math.PI); cx.fillStyle='#000000aa'; cx.fill();
+}
+function loop(){ if(!animating) return; draw(); requestAnimationFrame(loop); }
+
+function extractCrop(P,z0,y0,x0){
+  const out=new Float32Array(P*P*P); let sum=0,sum2=0;
+  for(let z=0;z<P;z++)for(let y=0;y<P;y++)for(let x=0;x<P;x++){
+    const v=vol[(z0+z)*Y*X+(y0+y)*X+(x0+x)]; out[z*P*P+y*P+x]=v; sum+=v; sum2+=v*v; }
+  const n=P*P*P, mean=sum/n, std=Math.sqrt(Math.max(1e-8, sum2/n-mean*mean));
+  for(let i=0;i<out.length;i++) out[i]=(out[i]-mean)/std;
+  return out;
+}
+function buildInter(P){ const inter=new Float32Array(7*P*P*P), b=boxes[P], S=P*P*P;
+  for(const c of clicks){ const ch=c.sign>0?3:4, cz=c.z-b.z0, cy=c.y-b.y0, cx0=c.x-b.x0;
+    for(const [dz,dy,dx] of BALL3){ const z=cz+dz,y=cy+dy,x=cx0+dx;
+      if(z<0||z>=P||y<0||y>=P||x<0||x>=P) continue; inter[ch*S+z*P*P+y*P+x]=1.0; } }
+  return inter;
+}
+function paintMask(P,buf){ const m=new Uint8Array(buf), b=boxes[P];
+  for(let z=0;z<P;z++)for(let y=0;y<P;y++)for(let x=0;x<P;x++)
+    mask[(b.z0+z)*Y*X+(b.y0+y)*X+(b.x0+x)] = m[z*P*P+y*P+x]; }
+function inBox(P,z,y,x){ const b=boxes[P]; return b && z>=b.z0&&z<b.z0+P && y>=b.y0&&y<b.y0+P && x>=b.x0&&x<b.x0+P; }
+
+const worker=new Worker('pathA-prog-worker.js?v=2',{type:'module'});
+let seqIdx=0;
+function processNext(){
+  if(seqIdx>=RES.length){ busy=false; animating=false; draw();   // done all tiers
+    if(AUTO) postAuto(); return; }
+  const P=RES[seqIdx]; tier[P]='computing'; tierBadges();
+  if(needEnc[P]){ const crop=extractCrop(P, boxes[P].z0, boxes[P].y0, boxes[P].x0);
+    worker.postMessage({type:'encode', res:P, image:crop.buffer}, [crop.buffer]); }
+  else { const inter=buildInter(P); worker.postMessage({type:'infer', res:P, inter:inter.buffer}, [inter.buffer]); }
+}
+worker.onmessage=(e)=>{ const d=e.data;
+  if(d.type==='loaded'){ log(`[${clk()}] ${d.res}³ pipeline loaded`); }
+  else if(d.type==='ready'){ ready=true; tierBadges();
+    sub.innerHTML=`<span class="pass">ready</span> — custom-WGSL 64³+128³ (192³ soon), load+warm ${(d.ms/1000).toFixed(1)}s. Click the CT.`;
+    if(AUTO) autoClick(); }
+  else if(d.type==='encoded'){ log(`[${clk()}] ${d.res}³ trunk encode ${d.ms}ms`);
+    const inter=buildInter(d.res); worker.postMessage({type:'infer', res:d.res, inter:inter.buffer}, [inter.buffer]); }
+  else if(d.type==='result'){ needEnc[d.res]=false; paintMask(d.res, d.mask); tier[d.res]='done'; tierBadges();
+    log(`[${clk()}] ${d.res}³ decode ${d.ms}ms · ${d.vox} vox`); if(d.res===128)window.__vox128=d.vox;
+    draw(); seqIdx++; processNext(); }
+  else if(d.type==='error'){ sub.innerHTML=`<span class="fail">✗ ${d.msg}</span>`; log('✗ '+d.msg); busy=false; animating=false; }
+};
+
+function onClick(ev){
+  if(!ready){ log('…not ready'); return; }
+  if(busy){ log('…busy'); return; }
+  ev.preventDefault();
+  const rect=cv.getBoundingClientRect();
+  const x=Math.floor((ev.clientX-rect.left)/(cv.width/X)), y=Math.floor((ev.clientY-rect.top)/(cv.height/Y)), z=+$('z').value;
+  const sign=(ev.shiftKey||ev.button===2)?-1:1;
+  const fresh = RES.some(P=>!boxes[P]||!inBox(P,z,y,x));
+  if(fresh){ mask.fill(0); clicks=[{z,y,x,sign}];
+    for(const P of ALL){ const z0=Math.max(0,Math.min(z-(P>>1),Z-P)),y0=Math.max(0,Math.min(y-(P>>1),Y-P)),x0=Math.max(0,Math.min(x-(P>>1),X-P));
+      boxes[P]={z0,y0,x0}; } for(const P of RES) needEnc[P]=true; }
+  else clicks.push({z,y,x,sign});
+  for(const P of RES) tier[P]='idle'; tier[192]='placeholder';
+  lastXY={x:x*(cv.width/X)+(cv.width/X)/2, y:y*(cv.height/Y)+(cv.height/Y)/2};
+  busy=true; animating=true; seqIdx=0; loop(); tierBadges(); processNext();
+}
+
+// ---- AUTO self-test ----
+function autoClick(){ if(!lab) return; const fg=[]; for(let z=0;z<Z;z++)for(let y=0;y<Y;y++)for(let x=0;x<X;x++) if(lab[(z*Y+y)*X+x]) fg.push([z,y,x]);
+  let mz=0,my=0,mx=0; for(const[z,y,x]of fg){mz+=z;my+=y;mx+=x;} mz/=fg.length;my/=fg.length;mx/=fg.length;
+  let best=1e18,az=0,ay=0,ax=0; for(const[z,y,x]of fg){const dd=(z-mz)**2+(y-my)**2+(x-mx)**2; if(dd<best){best=dd;az=z;ay=y;ax=x;}}
+  window.__auto={z:az,y:ay,x:ax}; $('z').value=az; const r=cv.getBoundingClientRect();
+  onClick({clientX:r.left+(ax+0.5)*(cv.width/X), clientY:r.top+(ay+0.5)*(cv.height/Y), shiftKey:false, button:0, preventDefault(){}}); }
+function postAuto(){ let a=0,b=0,inter=0; for(let i=0;i<mask.length;i++){ if(lab){ if(mask[i]&&lab[i])inter++; a+=mask[i]?1:0; b+=lab[i]?1:0; } }
+  const dice=(a+b)?2*inter/(a+b):0;
+  try{ fetch('/prog_png',{method:'POST',body:cv.toDataURL('image/png')}); }catch(x){}
+  try{ fetch('/prog_result',{method:'POST',body:JSON.stringify({vox128:window.__vox128,maskVox:a,diceVsIDC:dice})}); }catch(x){} }
+
+(async ()=>{
+  const meta=await (await fetch('real/full_meta.json')).json(); [Z,Y,X]=meta.shape;
+  ct=new Uint8Array(await (await fetch('real/full_ct_u8.bin')).arrayBuffer());
+  vol=new Int16Array(await (await fetch('real/full_vol_i16.bin')).arrayBuffer());
+  try{ lab=new Uint8Array(await (await fetch('real/full_lab_u8.bin')).arrayBuffer()); }catch(e){}
+  mask=new Uint8Array(Z*Y*X);
+  cv.width=Math.min(560,Math.round(X*2.2)); cv.height=Math.round(cv.width*Y/X);
+  $('z').max=Z-1; $('z').value=Math.floor(Z/2);
+  $('z').addEventListener('input',draw); for(const id of ['ov','rf','bx']) $(id).addEventListener('change',draw);
+  cv.addEventListener('mousedown',onClick); cv.addEventListener('contextmenu',e=>e.preventDefault());
+  cv.addEventListener('wheel',e=>{e.preventDefault(); const z=Math.max(0,Math.min(Z-1,+$('z').value+(e.deltaY>0?1:-1))); $('z').value=z; draw();},{passive:false});
+  $('clear').onclick=()=>{ boxes={}; clicks=[]; mask.fill(0); for(const P of RES)tier[P]='idle'; tier[192]='placeholder'; animating=false; tierBadges(); draw(); };
+  tierBadges(); draw();
+  sub.textContent='loading custom-WGSL pipelines (64³ + 128³)…';
+  worker.postMessage({type:'init', res:RES});
+  log(`[${clk()}] volume ${Z}×${Y}×${X} loaded; loading 64³+128³ pipelines…`);
+})();
+</script>
