@@ -1,0 +1,176 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nnLive — WebGPU device probe</title>
+<style>
+  body { font: 14px/1.5 -apple-system, system-ui, sans-serif; max-width: 820px; margin: 2rem auto; padding: 0 1rem; color: #111; }
+  h1 { font-size: 20px; } h2 { font-size: 15px; margin-top: 1.6rem; border-bottom: 1px solid #ddd; padding-bottom: 3px; }
+  table { border-collapse: collapse; width: 100%; margin: .4rem 0; }
+  td, th { text-align: left; padding: 3px 10px 3px 0; }
+  .pass { color: #0a7d28; font-weight: 600; } .fail { color: #c0242b; font-weight: 600; } .warn { color: #b26a00; font-weight: 600; }
+  code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
+  #tiers td:first-child { font-weight: 600; }
+  .muted { color: #666; }
+</style>
+<h1>nnLive — WebGPU device probe</h1>
+<p class="muted">Measures the three browser gates from the plan: <b>shader-f16</b>, a raisable
+<b>single-buffer binding</b> big enough for a variant's first activation tensor, and enough
+<b>total GPU memory</b> for one patch forward pass — plus a rough compute throughput number.
+Run this in the browser you want to use (Chrome/Edge recommended).</p>
+<div id="out">Probing…</div>
+
+<script type="module">
+const out = document.getElementById('out');
+const MB = 1024*1024, GB = 1024*1024*1024;
+const fmt = b => b >= GB ? (b/GB).toFixed(2)+' GiB' : (b/MB).toFixed(0)+' MiB';
+const row = (k,v) => `<tr><td>${k}</td><td>${v}</td></tr>`;
+
+// Per-variant first-full-res tensor (voxels * 32 features * 2 bytes fp16) and a peak estimate.
+const VARIANTS = [
+  { id:'nnlive-96',  patch:96,  firstTensor: 96*96*96*32*2,   peak: 0.5*GB },
+  { id:'nnlive-128', patch:128, firstTensor:128*128*128*32*2, peak: 1.2*GB },
+  { id:'nnlive-160', patch:160, firstTensor:160*160*160*32*2, peak: 2.3*GB },
+  { id:'teacher-192',patch:192, firstTensor:192*192*192*32*2, peak: 4.0*GB },
+];
+
+async function tryAlloc(device, size, usage) {
+  device.pushErrorScope('out-of-memory');
+  device.pushErrorScope('validation');
+  let buf = null;
+  try { buf = device.createBuffer({ size, usage }); } catch(e) { /* sync throw */ }
+  const vErr = await device.popErrorScope();
+  const oErr = await device.popErrorScope();
+  const ok = buf && !vErr && !oErr;
+  if (buf) buf.destroy();
+  return { ok, why: vErr ? 'validation' : oErr ? 'out-of-memory' : (buf?'':'threw') };
+}
+
+async function computeBench(device) {
+  // Dependent-chain FMA kernel: prevents the compiler eliding the loop. 2 flops/iter.
+  const N = 4*1024*1024, ITERS = 2048;
+  const code = `
+    @group(0) @binding(0) var<storage, read_write> data: array<f32>;
+    @compute @workgroup_size(256)
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+      let i = gid.x; if (i >= arrayLength(&data)) { return; }
+      var v = data[i];
+      for (var k=0u; k<${ITERS}u; k=k+1u) { v = v * 1.0000001 + 0.0000001; }
+      data[i] = v;
+    }`;
+  const mod = device.createShaderModule({ code });
+  const pipe = device.createComputePipeline({ layout:'auto', compute:{ module:mod, entryPoint:'main' } });
+  const buf = device.createBuffer({ size: N*4, usage: GPUBufferUsage.STORAGE });
+  const bg = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries:[{binding:0, resource:{buffer:buf}}] });
+  const runOnce = async () => {
+    const enc = device.createCommandEncoder();
+    const p = enc.beginComputePass(); p.setPipeline(pipe); p.setBindGroup(0,bg);
+    p.dispatchWorkgroups(Math.ceil(N/256)); p.end();
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+  };
+  await runOnce(); // warm-up
+  const t0 = performance.now();
+  const REPS = 5;
+  for (let r=0;r<REPS;r++) await runOnce();
+  const dt = (performance.now()-t0)/REPS/1000; // s per rep
+  buf.destroy();
+  const flops = N*ITERS*2*REPS;
+  return { gflops: (N*ITERS*2)/dt/1e9, msPerRep: dt*1000 };
+}
+
+async function main() {
+  if (!navigator.gpu) { out.innerHTML = `<p class="fail">✗ navigator.gpu is undefined — this browser has no WebGPU. In-browser inference is not possible here.</p>`; return; }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference:'high-performance' });
+  if (!adapter) { out.innerHTML = `<p class="fail">✗ requestAdapter() returned null — no WebGPU adapter available.</p>`; return; }
+
+  const L = adapter.limits;
+  const hasF16 = adapter.features.has('shader-f16');
+  let info = {};
+  try { info = adapter.info || (await adapter.requestAdapterInfo?.()) || {}; } catch {}
+
+  let html = `<h2>Adapter</h2><table>`;
+  html += row('vendor / architecture', `${info.vendor||'?'} / ${info.architecture||'?'} ${info.description?('— '+info.description):''}`);
+  html += row('shader-f16 feature', hasF16 ? `<span class="pass">✓ available</span>` : `<span class="fail">✗ missing (fp16 unavailable)</span>`);
+  html += row('maxStorageBufferBindingSize (adapter)', `${fmt(L.maxStorageBufferBindingSize)}`);
+  html += row('maxBufferSize (adapter)', `${fmt(L.maxBufferSize)}`);
+  html += row('maxComputeInvocationsPerWorkgroup', L.maxComputeInvocationsPerWorkgroup);
+  html += `</table>`;
+
+  // Request a device with raised limits + f16.
+  const want = {
+    maxStorageBufferBindingSize: Math.min(L.maxStorageBufferBindingSize, 2*GB),
+    maxBufferSize: Math.min(L.maxBufferSize, 2*GB),
+  };
+  let device;
+  try {
+    device = await adapter.requestDevice({
+      requiredFeatures: hasF16 ? ['shader-f16'] : [],
+      requiredLimits: want,
+    });
+  } catch(e) {
+    out.innerHTML = html + `<p class="fail">✗ requestDevice with raised limits failed: ${e.message}</p>`;
+    return;
+  }
+  html += `<h2>Device (raised limits granted)</h2><table>`;
+  html += row('granted maxStorageBufferBindingSize', `<span class="pass">${fmt(device.limits.maxStorageBufferBindingSize)}</span>`);
+  html += row('granted maxBufferSize', `<span class="pass">${fmt(device.limits.maxBufferSize)}</span>`);
+  html += `</table>`;
+
+  out.innerHTML = html + `<p class="muted">Testing per-variant allocation…</p>`;
+
+  // Per-variant feasibility.
+  let tiers = `<h2>Per-variant feasibility (measured)</h2>
+    <table id="tiers"><tr><th>variant</th><th>first tensor</th><th>single binding fits?</th><th>peak alloc (~) fits?</th><th>verdict</th></tr>`;
+  const U_STORAGE = GPUBufferUsage.STORAGE;
+  const variantResults = [];
+  for (const v of VARIANTS) {
+    const bind = await tryAlloc(device, v.firstTensor, U_STORAGE);
+    // Peak test: a few big buffers summing ~peak (freed immediately).
+    const chunk = Math.floor(v.peak/3);
+    const p1 = await tryAlloc(device, chunk, U_STORAGE);
+    const p2 = await tryAlloc(device, v.peak, GPUBufferUsage.STORAGE); // one big alloc as a proxy
+    const peakOk = p1.ok && p2.ok;
+    const verdict = (bind.ok && peakOk) ? `RUNS`
+                  : bind.ok ? `binding ok, peak tight`
+                  : `no`;
+    variantResults.push({ id:v.id, patch:v.patch, firstTensorBytes:v.firstTensor, bindingOk:bind.ok, bindingWhy:bind.why, peakOk, verdict });
+    tiers += `<tr><td>${v.id}</td><td>${fmt(v.firstTensor)}</td>
+      <td>${bind.ok?'<span class="pass">✓</span>':'<span class="fail">✗ '+bind.why+'</span>'}</td>
+      <td>${peakOk?'<span class="pass">✓ '+fmt(v.peak)+'</span>':'<span class="fail">✗</span>'}</td>
+      <td class="${verdict==='RUNS'?'pass':verdict==='no'?'fail':'warn'}">${verdict}</td></tr>`;
+  }
+  tiers += `</table>`;
+  out.innerHTML = html + tiers + `<p class="muted">Running compute throughput microbenchmark…</p>`;
+
+  const bench = await computeBench(device);
+  const benchHtml = `<h2>Compute throughput (rough)</h2><table>`
+    + row('f32 FMA throughput', `${bench.gflops.toFixed(0)} GFLOP/s <span class="muted">(${bench.msPerRep.toFixed(1)} ms / 16 GFLOP kernel)</span>`)
+    + `</table><p class="muted">This is a synthetic FMA rate, not a real forward-pass time — it calibrates
+       whether per-patch latency will land in the interactive range. Real per-patch numbers come from the
+       ONNX model once exported.</p>`;
+
+  out.innerHTML = html + tiers + benchHtml
+    + `<h2>Summary</h2><p>Results have been sent back to the nnLive session automatically. Key results:
+       <b>shader-f16</b> = ${hasF16?'yes':'NO'}, <b>granted binding</b> = ${fmt(device.limits.maxStorageBufferBindingSize)},
+       and the per-variant <b>RUNS</b> rows above are the tiers this machine can host in-browser.</p>`;
+
+  const report = {
+    ok: true,
+    userAgent: navigator.userAgent,
+    adapter: { vendor: info.vendor, architecture: info.architecture, description: info.description },
+    shaderF16: hasF16,
+    adapterLimits: {
+      maxStorageBufferBindingSize: L.maxStorageBufferBindingSize,
+      maxBufferSize: L.maxBufferSize,
+      maxComputeInvocationsPerWorkgroup: L.maxComputeInvocationsPerWorkgroup,
+    },
+    grantedLimits: {
+      maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,
+      maxBufferSize: device.limits.maxBufferSize,
+    },
+    variants: variantResults,
+    bench,
+  };
+  try { await fetch('/result', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(report, null, 2) }); } catch(e){}
+}
+main().catch(e => { out.innerHTML += `<p class="fail">probe error: ${e.message}</p>`; console.error(e); });
+</script>

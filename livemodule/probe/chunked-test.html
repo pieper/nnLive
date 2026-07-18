@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nnLive — chunked WebGPU teacher (192³)</title>
+<style>
+  body{font:14px/1.5 system-ui,sans-serif;max-width:860px;margin:1.5rem auto;padding:0 1rem}
+  #log{white-space:pre-wrap;background:#f6f6f6;padding:12px;border-radius:6px;font-family:ui-monospace,monospace;font-size:12.5px;max-height:60vh;overflow:auto}
+  .pass{color:#0a7d28;font-weight:600}.fail{color:#c0242b;font-weight:600}.run{color:#b26a00}
+  #bar{height:12px;background:#eee;border-radius:6px;overflow:hidden;margin:.5rem 0}
+  #barfill{height:100%;width:0;background:#0a7d28;transition:width .15s}
+  #now{font-weight:600}
+</style>
+<h1>nnLive — chunked WebGPU teacher (full 192³ nnInteractive)</h1>
+<p>Full 102M-param teacher as many short GPU submissions in a Web Worker, draining between chunks so
+the screen keeps repainting. Live status: <span id="now">starting…</span></p>
+<div id="bar"><div id="barfill"></div></div>
+<div id="log"></div>
+<script type="module">
+const logEl=document.getElementById('log'), fill=document.getElementById('barfill'), now=document.getElementById('now'), lines=[];
+const log=s=>{lines.push(s);logEl.textContent=lines.join('\n');logEl.scrollTop=logEl.scrollHeight};
+const post=async o=>{try{await fetch('/chunked',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o,null,2)})}catch(e){}};
+const t0=performance.now(); const clk=()=>((performance.now()-t0)/1000).toFixed(1)+'s';
+
+(async () => {
+  if(!navigator.gpu){ now.textContent='no WebGPU'; return; }
+  const manifest = await (await fetch('chunks/chunks.json')).json();
+  const N = manifest.chunks.length;
+  log(`[${clk()}] loaded manifest: ${N} chunks (${manifest.src})`);
+  const baseUrl = new URL('chunks/', location.href).href;
+  const worker = new Worker('chunked-worker.js?v=frugal', {type:'module'});
+  const report = {ok:false, model:manifest.src, chunks:N, loaded:0, started:null, progress:[]};
+  worker.onmessage = async (e) => {
+    const {type, data} = e.data;
+    if(type==='load'){ report.loaded=data.k+1; now.textContent=`loading sessions ${data.k+1}/${data.n}`; log(`[${clk()}] loaded chunk ${data.k} session (${data.ms} ms)`); fill.style.width=(40*(data.k+1)/data.n)+'%'; if(data.k+1===data.n){log(`[${clk()}] all sessions loaded — running…`);} await post(report); }
+    else if(type==='chunkstart'){ report.started=data.k; now.innerHTML=`<span class="run">running chunk ${data.k}/${data.n}…</span>`; log(`[${clk()}] chunk ${data.k} running…`); await post(report); }
+    else if(type==='chunkdone'){ report.progress.push({k:data.k,dt:data.dt}); now.textContent=`chunk ${data.k} done (${data.dt} ms)`; log(`[${clk()}] chunk ${data.k}: ${data.dt} ms  (elapsed ${(data.elapsed/1000).toFixed(1)}s)`); fill.style.width=(40+60*(data.k+1)/data.n)+'%'; await post(report); }
+    else if(type==='done'){ report.ok=true; report.totalMs=data.total; report.perChunkMs=data.times; report.outDims=data.outDims; now.textContent='done'; log(`\n[${clk()}] TOTAL: ${(data.total/1000).toFixed(2)} s  output ${data.outDims.join('x')}`); logEl.insertAdjacentHTML('beforeend',`\n<span class="pass">✓ full 192³ teacher ran on WebGPU, chunked — ${(data.total/1000).toFixed(2)} s/forward</span>`); await post(report); }
+    else if(type==='error'){ report.error=data; now.textContent='error'; log(`\n✗ ${data}`); logEl.insertAdjacentHTML('beforeend',`\n<span class="fail">✗ ${data}</span>`); await post(report); }
+  };
+  worker.postMessage({ baseUrl, manifest, inputDims:[1,8,192,192,192] });
+})();
+</script>

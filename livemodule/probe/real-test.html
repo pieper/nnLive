@@ -1,0 +1,103 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nnLive — teacher on real CT (chunked WebGPU)</title>
+<style>
+  body{font:14px/1.5 system-ui,sans-serif;max-width:980px;margin:1.2rem auto;padding:0 1rem}
+  #log{white-space:pre-wrap;background:#f6f6f6;padding:10px;border-radius:6px;font-family:ui-monospace,monospace;font-size:12px;max-height:34vh;overflow:auto}
+  .pass{color:#0a7d28;font-weight:600}.fail{color:#c0242b;font-weight:600}.run{color:#b26a00}
+  #bar{height:12px;background:#eee;border-radius:6px;overflow:hidden;margin:.4rem 0}
+  #barfill{height:100%;width:0;background:#0a7d28;transition:width .12s}
+  .row{display:flex;gap:1.5rem;align-items:flex-start;flex-wrap:wrap}
+  canvas{image-rendering:pixelated;border:1px solid #ccc;border-radius:4px;background:#000}
+  label{user-select:none} .muted{color:#666}
+</style>
+<h1>nnLive — full nnInteractive teacher on real CT</h1>
+<p id="sub" class="muted">loading…</p>
+<div id="bar"><div id="barfill"></div></div>
+<div class="row">
+  <div>
+    <canvas id="cv" width="384" height="384"></canvas>
+    <div style="margin-top:.4rem">
+      slice <input id="z" type="range" min="0" max="127" value="64" style="width:240px"> <span id="zv">64</span>
+      <label style="margin-left:1rem"><input id="ov" type="checkbox" checked> mask</label>
+      <label style="margin-left:.6rem"><input id="rf" type="checkbox"> IDC seg (ref)</label>
+    </div>
+  </div>
+  <div id="log"></div>
+</div>
+<script type="module">
+const $=id=>document.getElementById(id);
+const logEl=$('log'), fill=$('barfill'), sub=$('sub'), lines=[];
+const log=s=>{lines.push(s);logEl.textContent=lines.join('\n');logEl.scrollTop=logEl.scrollHeight};
+const post=async o=>{try{await fetch('/realresult',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o,null,2)})}catch(e){}};
+const t0=performance.now(), clk=()=>((performance.now()-t0)/1000).toFixed(1)+'s';
+
+// --- config: which patch size to run (128 memory-safe, 192 native) ---
+const D = new URLSearchParams(location.search).get('d') ? +new URLSearchParams(location.search).get('d') : 128;
+
+let ct, seg, mask=null, meta;
+const cv=$('cv'), cx=cv.getContext('2d');
+function draw(){
+  const z=+$('z').value; $('zv').textContent=z;
+  const img=cx.createImageData(D,D), o=z*D*D;
+  const showMask=$('ov').checked && mask, showRef=$('rf').checked && seg;
+  for(let i=0;i<D*D;i++){
+    const g=ct[o+i]; let r=g,gr=g,b=g;
+    if(showRef && seg[o+i]){ r=(r+0)>>1; gr=(gr+180)>>1; b=(b+0)>>1; }   // IDC seg = green tint
+    if(showMask && mask[o+i]){ r=(r+255)>>1; gr=gr>>1; b=b>>1; }          // network mask = red tint
+    const p=i*4; img.data[p]=r; img.data[p+1]=gr; img.data[p+2]=b; img.data[p+3]=255;
+  }
+  // nearest-neighbor upscale to canvas
+  const tmp=new OffscreenCanvas(D,D); tmp.getContext('2d').putImageData(img,0,0);
+  cx.imageSmoothingEnabled=false; cx.clearRect(0,0,cv.width,cv.height);
+  cx.drawImage(tmp,0,0,cv.width,cv.height);
+  // click marker if on this slice
+  if(meta && meta.click_zyx && meta.click_zyx[0]===z){
+    const sx=cv.width/D, sy=cv.height/D, cxp=meta.click_zyx[2]*sx, cyp=meta.click_zyx[1]*sy;
+    cx.strokeStyle='#00e0ff'; cx.lineWidth=2;
+    cx.beginPath(); cx.moveTo(cxp-7,cyp); cx.lineTo(cxp+7,cyp); cx.moveTo(cxp,cyp-7); cx.lineTo(cxp,cyp+7); cx.stroke();
+  }
+}
+$('z').addEventListener('input',draw); $('ov').addEventListener('change',draw); $('rf').addEventListener('change',draw);
+
+(async () => {
+  if(!navigator.gpu){ sub.innerHTML='<span class="fail">no WebGPU in this browser</span>'; return; }
+  $('z').max=D-1; $('z').value=(D>>1);
+  cv.width=cv.height=Math.min(512, D*3);
+  meta=(await (await fetch('real/meta.json')).json());
+  meta.click_zyx = meta.patches[String(D)].click_zyx;
+  sub.innerHTML=`case <b>${meta.case}</b> (${meta.col}) · organ segid ${meta.segid} · running at <b>${D}³</b> · 1 positive click`;
+  log(`[${clk()}] case ${meta.case} ${meta.col}, segid ${meta.segid}, click@${meta.click_zyx}`);
+
+  ct = new Uint8Array(await (await fetch(`real/ct_${D}.u8`)).arrayBuffer());
+  try{ seg = new Uint8Array(await (await fetch(`real/seg_${D}.u8`)).arrayBuffer()); }catch(e){ seg=null; }
+  draw();  // show the CT + click before inference
+
+  const qChunks = new URLSearchParams(location.search).get('chunks');  // override to run e.g. the student chunks
+  const chunkDir = qChunks ? (qChunks.replace(/\/?$/, '/')) : ((D === 192) ? 'chunks/' : `chunks_${D}/`);
+  const manifest = await (await fetch(chunkDir + 'chunks.json')).json();
+  const N = manifest.chunks.length;
+  const baseUrl = new URL(chunkDir, location.href).href;
+  const inputBuffer = await (await fetch(`real/input_${D}.f32`)).arrayBuffer();
+  log(`[${clk()}] input ${(inputBuffer.byteLength/1e6).toFixed(0)}MB, ${N} chunks — starting…`);
+
+  const worker = new Worker('real-worker.js?v=2', {type:'module'});
+  const report={ok:false, case:meta.case, D, chunks:N, progress:[]};
+  worker.onmessage = async (e)=>{
+    const {type,data}=e.data;
+    if(type==='chunkstart'){ sub.innerHTML=`<span class="run">chunk ${data.k}/${data.n} (${data.file})…</span>`; log(`[${clk()}] chunk ${data.k} running…`); await post(report); }
+    else if(type==='chunkdone'){ report.progress.push({k:data.k,dt:data.dt,load:data.loadMs}); log(`[${clk()}] chunk ${data.k}: run ${data.dt}ms load ${data.loadMs}ms (elapsed ${(data.elapsed/1000).toFixed(1)}s)`); fill.style.width=(100*(data.k+1)/data.n)+'%'; await post(report); }
+    else if(type==='done'){
+      mask=new Uint8Array(data.mask);
+      report.ok=true; report.totalMs=data.total; report.fg=data.fg; report.dims=data.dims;
+      // agreement with the IDC seg (reference only — NOT ground truth)
+      if(seg){ let inter=0,a=0,b=0; for(let i=0;i<mask.length;i++){a+=mask[i];b+=seg[i];if(mask[i]&&seg[i])inter++;} report.dice_vs_idcseg=(2*inter/(a+b||1)); }
+      sub.innerHTML=`<span class="pass">✓ ran ${D}³ in ${(data.total/1000).toFixed(1)}s — ${data.fg} fg voxels`+(report.dice_vs_idcseg!=null?` · Dice vs IDC seg ${report.dice_vs_idcseg.toFixed(3)}`:``)+`</span>`;
+      log(`\n[${clk()}] DONE ${(data.total/1000).toFixed(2)}s, ${data.fg} fg voxels`+(report.dice_vs_idcseg!=null?`, Dice vs IDC seg ${report.dice_vs_idcseg.toFixed(3)}`:``));
+      draw(); await post(report);
+    }
+    else if(type==='error'){ report.error=data; sub.innerHTML=`<span class="fail">✗ ${data}</span>`; log(`\n✗ ${data}`); await post(report); }
+  };
+  worker.postMessage({ baseUrl, manifest, inputBuffer, inputDims:[1,8,D,D,D] }, [inputBuffer]);
+})();
+</script>

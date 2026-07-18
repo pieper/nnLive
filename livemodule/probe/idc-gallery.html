@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nnLive — IDC training-data check (v2, resampled)</title>
+<style>
+  body{font:14px/1.5 system-ui,sans-serif;margin:1.5rem;background:#111;color:#eee}
+  h1{font-size:19px}
+  .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;max-width:1300px}
+  figure{margin:0;background:#000;border-radius:8px;overflow:hidden}
+  img{width:100%;display:block}
+  figcaption{padding:6px 10px;font-size:13px;color:#bbd}
+</style>
+<h1>IDC data check v2 — get_volume() + resample (NLST A-P flip should be fixed)</h1>
+<div class="grid">
+  <figure><img src="r_kits0.png?v=2"><figcaption>KiTS — kidney + tumor (should still be correct)</figcaption></figure>
+  <figure><img src="r_nlst0.png?v=2"><figcaption>NLST — TotalSegmentator (77 labels) — check A-P orientation</figcaption></figure>
+  <figure><img src="r_nlst1.png?v=2"><figcaption>NLST — TotalSegmentator (68 labels) — check A-P orientation</figcaption></figure>
+</div>

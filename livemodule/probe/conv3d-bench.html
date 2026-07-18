@@ -1,0 +1,366 @@
+<!doctype html>
+<meta charset="utf-8"><title>WGSL Conv3D benchmark (naive vs tiled implicit-GEMM)</title>
+<body style="font:13px ui-monospace,monospace;white-space:pre-wrap;padding:1rem" id="o">
+<script type="module">
+const o=document.getElementById('o'); const log=s=>{o.textContent+=s+'\n';};
+const PREC = new URLSearchParams(location.search).get('prec') || 'f32';   // f32 | f16
+const POST = (obj)=>{ try{ fetch('/conv3d_result',{method:'POST',body:JSON.stringify(obj)}); }catch(e){} };
+
+// ---- WGSL: uniforms shared by both kernels ----
+// dims: Ci, Co, D, H, W, K(=Ci*27), Nvox(=D*H*W), Ktiles(=ceil(K/16))
+const T = 16;
+
+function naiveWGSL(scalar){ return `
+struct Dims { Ci:u32, Co:u32, D:u32, H:u32, W:u32, K:u32, Nvox:u32, aux:u32 };
+@group(0) @binding(0) var<storage,read> inp: array<${scalar}>;
+@group(0) @binding(1) var<storage,read> wgt: array<${scalar}>;
+@group(0) @binding(2) var<storage,read_write> outp: array<${scalar}>;
+@group(0) @binding(3) var<uniform> d: Dims;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>){
+  let idx = (wid.y*d.aux + wid.x)*64u + lid.x;   // 2D workgroup grid -> flat (dodges 65535 cap)
+  let total = d.Co * d.Nvox;
+  if(idx >= total){ return; }
+  let co = idx / d.Nvox;
+  let n = idx % d.Nvox;
+  let HW = d.H * d.W;
+  let oz = n / HW; let rem = n % HW; let oy = rem / d.W; let ox = rem % d.W;
+  var acc: ${scalar} = ${scalar}(0);
+  for(var ci:u32=0u; ci<d.Ci; ci++){
+    for(var kz:u32=0u; kz<3u; kz++){ let iz = i32(oz)+i32(kz)-1;
+      if(iz<0 || iz>=i32(d.D)){ continue; }
+      for(var ky:u32=0u; ky<3u; ky++){ let iy = i32(oy)+i32(ky)-1;
+        if(iy<0 || iy>=i32(d.H)){ continue; }
+        for(var kx:u32=0u; kx<3u; kx++){ let ix = i32(ox)+i32(kx)-1;
+          if(ix<0 || ix>=i32(d.W)){ continue; }
+          let iv = inp[((ci*d.D + u32(iz))*d.H + u32(iy))*d.W + u32(ix)];
+          let wv = wgt[((co*d.Ci + ci)*27u) + (kz*9u+ky*3u+kx)];
+          acc += iv*wv;
+        }
+      }
+    }
+  }
+  outp[co*d.Nvox + n] = acc;
+}`; }
+
+// register-blocked implicit-GEMM Conv3D: C[Co,Nvox]=W[Co,K]@im2col[K,Nvox], K=Ci*27
+// BM=BN=64 output tile, BK=16, each of 256 threads computes TM*TN=4*4=16 outputs.
+// Dims adds gridXN = # of N-tiles along dispatch.x (N-tiles split across x and z to dodge 65535 cap).
+const BM=64, BN=64, BK=16, TM=4, TN=4;
+function tiledWGSL(scalar){ return `
+struct Dims { Ci:u32, Co:u32, D:u32, H:u32, W:u32, K:u32, Nvox:u32, gridXN:u32 };
+@group(0) @binding(0) var<storage,read> inp: array<${scalar}>;
+@group(0) @binding(1) var<storage,read> wgt: array<${scalar}>;
+@group(0) @binding(2) var<storage,read_write> outp: array<${scalar}>;
+@group(0) @binding(3) var<uniform> d: Dims;
+var<workgroup> As: array<${scalar}, ${BM*BK}>;   // [BM][BK]
+var<workgroup> Bs: array<${scalar}, ${BK*BN}>;   // [BK][BN]
+@compute @workgroup_size(16,16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>){
+  let tid = lid.y*16u + lid.x;                    // 0..255
+  let rowBase = wid.y*${BM}u;                     // output-channel tile base
+  let ntile = wid.z*d.gridXN + wid.x;             // N-tile index
+  let colBase = ntile*${BN}u;
+  let HW = d.H*d.W; let Ktiles = (d.K + ${BK}u - 1u)/${BK}u;
+  var acc: array<${scalar}, ${TM*TN}>;
+  for(var i=0u;i<${TM*TN}u;i++){ acc[i]=${scalar}(0); }
+  for(var kk:u32=0u; kk<Ktiles; kk++){
+    // load As (BM*BK=1024) : 4 per thread
+    for(var li=0u; li<4u; li++){ let e = tid + li*256u; let m = e/${BK}u; let k = e%${BK}u;
+      let gk = kk*${BK}u + k; let gm = rowBase + m;
+      As[e] = select(${scalar}(0), wgt[gm*d.K + gk], gm<d.Co && gk<d.K); }
+    // load Bs (BK*BN=1024) via im2col : 4 per thread
+    for(var li=0u; li<4u; li++){ let e = tid + li*256u; let k = e/${BN}u; let n = e%${BN}u;
+      let gk = kk*${BK}u + k; let gn = colBase + n;
+      var bv = ${scalar}(0);
+      if(gk<d.K && gn<d.Nvox){ let ci=gk/27u; let tap=gk%27u; let kz=tap/9u; let ky=(tap/3u)%3u; let kx=tap%3u;
+        let oz=gn/HW; let rem=gn%HW; let oy=rem/d.W; let ox=rem%d.W;
+        let iz=i32(oz)+i32(kz)-1; let iy=i32(oy)+i32(ky)-1; let ix=i32(ox)+i32(kx)-1;
+        if(iz>=0&&iz<i32(d.D)&&iy>=0&&iy<i32(d.H)&&ix>=0&&ix<i32(d.W)){ bv=inp[((ci*d.D+u32(iz))*d.H+u32(iy))*d.W+u32(ix)]; } }
+      Bs[e]=bv; }
+    workgroupBarrier();
+    for(var kx=0u; kx<${BK}u; kx++){
+      var af: array<${scalar}, ${TM}>; var bf: array<${scalar}, ${TN}>;
+      for(var i=0u;i<${TM}u;i++){ af[i]=As[(lid.y*${TM}u+i)*${BK}u + kx]; }
+      for(var j=0u;j<${TN}u;j++){ bf[j]=Bs[kx*${BN}u + lid.x*${TN}u + j]; }
+      for(var i=0u;i<${TM}u;i++){ for(var j=0u;j<${TN}u;j++){ acc[i*${TN}u+j] += af[i]*bf[j]; } }
+    }
+    workgroupBarrier();
+  }
+  for(var i=0u;i<${TM}u;i++){ let gm = rowBase + lid.y*${TM}u + i; if(gm>=d.Co){ continue; }
+    for(var j=0u;j<${TN}u;j++){ let gn = colBase + lid.x*${TN}u + j; if(gn>=d.Nvox){ continue; }
+      outp[gm*d.Nvox + gn] = acc[i*${TN}u+j]; } }
+}`; }
+
+// VECTORIZED (vec4<f16> along K) + fully-unrolled register-blocked Conv3D. f16 only.
+// As[m][k4] and Bs[n][k4] are vec4<f16>; acc in f32; TM=TN=4, BM=BN=64, BK=16 (4 vec4/K-tile).
+function tiledVWGSL(){ return `
+struct Dims { Ci:u32, Co:u32, D:u32, H:u32, W:u32, K:u32, Nvox:u32, aux:u32 };
+@group(0) @binding(0) var<storage,read> inp: array<f16>;
+@group(0) @binding(1) var<storage,read> wgt: array<f16>;
+@group(0) @binding(2) var<storage,read_write> outp: array<f16>;
+@group(0) @binding(3) var<uniform> d: Dims;
+var<workgroup> As: array<vec4<f16>, 256>;   // [BM=64][k4=4]
+var<workgroup> Bs: array<vec4<f16>, 256>;   // [BN=64][k4=4]
+fn gatherB(gk:u32, oz:u32, oy:u32, ox:u32) -> f16 {
+  if(gk>=d.K){ return f16(0); }
+  let ci=gk/27u; let tap=gk%27u; let kz=tap/9u; let ky=(tap/3u)%3u; let kx=tap%3u;
+  let iz=i32(oz)+i32(kz)-1; let iy=i32(oy)+i32(ky)-1; let ix=i32(ox)+i32(kx)-1;
+  if(iz<0||iz>=i32(d.D)||iy<0||iy>=i32(d.H)||ix<0||ix>=i32(d.W)){ return f16(0); }
+  return inp[((ci*d.D+u32(iz))*d.H+u32(iy))*d.W+u32(ix)];
+}
+@compute @workgroup_size(16,16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>){
+  let tid = lid.y*16u + lid.x;
+  let rowBase = wid.y*64u;
+  let ntile = wid.z*d.aux + wid.x; let colBase = ntile*64u;
+  let HW=d.H*d.W; let Ktiles=(d.K+15u)/16u;
+  let ar=lid.y*4u; let br=lid.x*4u;
+  var acc: array<f32,16>;
+  for(var i=0u;i<16u;i++){ acc[i]=0.0; }
+  for(var kk:u32=0u; kk<Ktiles; kk++){
+    // load As[tid] : m=tid/4, k4=tid%4 -> vec4 of wgt[gm*K + kk*16 + k4*4 + 0..3]
+    { let m=tid/4u; let k4=tid%4u; let gm=rowBase+m; let base=kk*16u+k4*4u;
+      var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gm<d.Co){ let o=gm*d.K+base;
+        if(base+0u<d.K){ v.x=wgt[o]; } if(base+1u<d.K){ v.y=wgt[o+1u]; }
+        if(base+2u<d.K){ v.z=wgt[o+2u]; } if(base+3u<d.K){ v.w=wgt[o+3u]; } }
+      As[tid]=v; }
+    // load Bs[tid] : n=tid/4, k4=tid%4 -> vec4 im2col
+    { let n=tid/4u; let k4=tid%4u; let gn=colBase+n; let base=kk*16u+k4*4u;
+      var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gn<d.Nvox){ let oz=gn/HW; let rem=gn%HW; let oy=rem/d.W; let ox=rem%d.W;
+        v.x=gatherB(base,oz,oy,ox); v.y=gatherB(base+1u,oz,oy,ox);
+        v.z=gatherB(base+2u,oz,oy,ox); v.w=gatherB(base+3u,oz,oy,ox); }
+      Bs[tid]=v; }
+    workgroupBarrier();
+    for(var k4=0u;k4<4u;k4++){
+      let a0=As[(ar+0u)*4u+k4]; let a1=As[(ar+1u)*4u+k4]; let a2=As[(ar+2u)*4u+k4]; let a3=As[(ar+3u)*4u+k4];
+      let b0=Bs[(br+0u)*4u+k4]; let b1=Bs[(br+1u)*4u+k4]; let b2=Bs[(br+2u)*4u+k4]; let b3=Bs[(br+3u)*4u+k4];
+      acc[0]+=f32(dot(a0,b0)); acc[1]+=f32(dot(a0,b1)); acc[2]+=f32(dot(a0,b2)); acc[3]+=f32(dot(a0,b3));
+      acc[4]+=f32(dot(a1,b0)); acc[5]+=f32(dot(a1,b1)); acc[6]+=f32(dot(a1,b2)); acc[7]+=f32(dot(a1,b3));
+      acc[8]+=f32(dot(a2,b0)); acc[9]+=f32(dot(a2,b1)); acc[10]+=f32(dot(a2,b2)); acc[11]+=f32(dot(a2,b3));
+      acc[12]+=f32(dot(a3,b0)); acc[13]+=f32(dot(a3,b1)); acc[14]+=f32(dot(a3,b2)); acc[15]+=f32(dot(a3,b3));
+    }
+    workgroupBarrier();
+  }
+  for(var i=0u;i<4u;i++){ let gm=rowBase+ar+i; if(gm>=d.Co){ continue; }
+    for(var j=0u;j<4u;j++){ let gn=colBase+br+j; if(gn>=d.Nvox){ continue; }
+      outp[gm*d.Nvox+gn]=f16(acc[i*4u+j]); } }
+}`; }
+
+// 8x8 register tile (BM=BN=128), vec4<f16> along K, f32 acc. Higher arithmetic intensity.
+function tiledV8WGSL(){ return `
+struct Dims { Ci:u32, Co:u32, D:u32, H:u32, W:u32, K:u32, Nvox:u32, aux:u32 };
+@group(0) @binding(0) var<storage,read> inp: array<f16>;
+@group(0) @binding(1) var<storage,read> wgt: array<f16>;
+@group(0) @binding(2) var<storage,read_write> outp: array<f16>;
+@group(0) @binding(3) var<uniform> d: Dims;
+var<workgroup> As: array<vec4<f16>, 512>;   // [BM=128][k4=4]
+var<workgroup> Bs: array<vec4<f16>, 512>;   // [BN=128][k4=4]
+fn gB(gk:u32, oz:u32, oy:u32, ox:u32) -> f16 {
+  if(gk>=d.K){ return f16(0); }
+  let ci=gk/27u; let tap=gk%27u; let kz=tap/9u; let ky=(tap/3u)%3u; let kx=tap%3u;
+  let iz=i32(oz)+i32(kz)-1; let iy=i32(oy)+i32(ky)-1; let ix=i32(ox)+i32(kx)-1;
+  if(iz<0||iz>=i32(d.D)||iy<0||iy>=i32(d.H)||ix<0||ix>=i32(d.W)){ return f16(0); }
+  return inp[((ci*d.D+u32(iz))*d.H+u32(iy))*d.W+u32(ix)];
+}
+@compute @workgroup_size(16,16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>){
+  let tid=lid.y*16u+lid.x;
+  let rowBase=wid.y*128u; let ntile=wid.z*d.aux+wid.x; let colBase=ntile*128u;
+  let HW=d.H*d.W; let Ktiles=(d.K+15u)/16u;
+  let ar=lid.y*8u; let br=lid.x*8u;
+  var acc: array<f32,64>; for(var i=0u;i<64u;i++){ acc[i]=0.0; }
+  for(var kk:u32=0u; kk<Ktiles; kk++){
+    for(var li=0u; li<2u; li++){ let e=tid+li*256u; let m=e/4u; let k4=e%4u; let gm=rowBase+m; let base=kk*16u+k4*4u;
+      var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gm<d.Co){ let o=gm*d.K+base;
+        if(base<d.K){v.x=wgt[o];} if(base+1u<d.K){v.y=wgt[o+1u];} if(base+2u<d.K){v.z=wgt[o+2u];} if(base+3u<d.K){v.w=wgt[o+3u];} }
+      As[e]=v; }
+    for(var li=0u; li<2u; li++){ let e=tid+li*256u; let n=e/4u; let k4=e%4u; let gn=colBase+n; let base=kk*16u+k4*4u;
+      var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gn<d.Nvox){ let oz=gn/HW; let rem=gn%HW; let oy=rem/d.W; let ox=rem%d.W;
+        v.x=gB(base,oz,oy,ox); v.y=gB(base+1u,oz,oy,ox); v.z=gB(base+2u,oz,oy,ox); v.w=gB(base+3u,oz,oy,ox); }
+      Bs[e]=v; }
+    workgroupBarrier();
+    for(var k4=0u;k4<4u;k4++){
+      var af: array<vec4<f16>,8>; var bf: array<vec4<f16>,8>;
+      for(var i=0u;i<8u;i++){ af[i]=As[(ar+i)*4u+k4]; bf[i]=Bs[(br+i)*4u+k4]; }
+      for(var i=0u;i<8u;i++){ for(var j=0u;j<8u;j++){ acc[i*8u+j]+=f32(dot(af[i],bf[j])); } }
+    }
+    workgroupBarrier();
+  }
+  for(var i=0u;i<8u;i++){ let gm=rowBase+ar+i; if(gm>=d.Co){ continue; }
+    for(var j=0u;j<8u;j++){ let gn=colBase+br+j; if(gn>=d.Nvox){ continue; }
+      outp[gm*d.Nvox+gn]=f16(acc[i*8u+j]); } }
+}`; }
+
+// small-M tile (BM=32,BN=128), vec4<f16> along K, TM=2,TN=8 -> more N-reuse for low-channel/high-res layers.
+function tiledVsmWGSL(){ return `
+struct Dims { Ci:u32, Co:u32, D:u32, H:u32, W:u32, K:u32, Nvox:u32, aux:u32 };
+@group(0) @binding(0) var<storage,read> inp: array<f16>;
+@group(0) @binding(1) var<storage,read> wgt: array<f16>;
+@group(0) @binding(2) var<storage,read_write> outp: array<f16>;
+@group(0) @binding(3) var<uniform> d: Dims;
+var<workgroup> As: array<vec4<f16>, 128>;   // [BM=32][k4=4]
+var<workgroup> Bs: array<vec4<f16>, 512>;   // [BN=128][k4=4]
+fn gS(gk:u32, oz:u32, oy:u32, ox:u32) -> f16 {
+  if(gk>=d.K){ return f16(0); }
+  let ci=gk/27u; let tap=gk%27u; let kz=tap/9u; let ky=(tap/3u)%3u; let kx=tap%3u;
+  let iz=i32(oz)+i32(kz)-1; let iy=i32(oy)+i32(ky)-1; let ix=i32(ox)+i32(kx)-1;
+  if(iz<0||iz>=i32(d.D)||iy<0||iy>=i32(d.H)||ix<0||ix>=i32(d.W)){ return f16(0); }
+  return inp[((ci*d.D+u32(iz))*d.H+u32(iy))*d.W+u32(ix)];
+}
+@compute @workgroup_size(16,16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>){
+  let tid=lid.y*16u+lid.x;
+  let rowBase=wid.y*32u; let ntile=wid.z*d.aux+wid.x; let colBase=ntile*128u;
+  let HW=d.H*d.W; let Ktiles=(d.K+15u)/16u;
+  let ar=lid.y*2u; let br=lid.x*8u;
+  var acc: array<f32,16>; for(var i=0u;i<16u;i++){ acc[i]=0.0; }
+  for(var kk:u32=0u; kk<Ktiles; kk++){
+    if(tid<128u){ let m=tid/4u; let k4=tid%4u; let gm=rowBase+m; let base=kk*16u+k4*4u;
+      var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gm<d.Co){ let o=gm*d.K+base;
+        if(base<d.K){v.x=wgt[o];} if(base+1u<d.K){v.y=wgt[o+1u];} if(base+2u<d.K){v.z=wgt[o+2u];} if(base+3u<d.K){v.w=wgt[o+3u];} }
+      As[tid]=v; }
+    for(var li=0u; li<2u; li++){ let e=tid+li*256u; let n=e/4u; let k4=e%4u; let gn=colBase+n; let base=kk*16u+k4*4u;
+      var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gn<d.Nvox){ let oz=gn/HW; let rem=gn%HW; let oy=rem/d.W; let ox=rem%d.W;
+        v.x=gS(base,oz,oy,ox); v.y=gS(base+1u,oz,oy,ox); v.z=gS(base+2u,oz,oy,ox); v.w=gS(base+3u,oz,oy,ox); }
+      Bs[e]=v; }
+    workgroupBarrier();
+    for(var k4=0u;k4<4u;k4++){
+      var af: array<vec4<f16>,2>; var bf: array<vec4<f16>,8>;
+      for(var i=0u;i<2u;i++){ af[i]=As[(ar+i)*4u+k4]; }
+      for(var j=0u;j<8u;j++){ bf[j]=Bs[(br+j)*4u+k4]; }
+      for(var i=0u;i<2u;i++){ for(var j=0u;j<8u;j++){ acc[i*8u+j]+=f32(dot(af[i],bf[j])); } }
+    }
+    workgroupBarrier();
+  }
+  for(var i=0u;i<2u;i++){ let gm=rowBase+ar+i; if(gm>=d.Co){ continue; }
+    for(var j=0u;j<8u;j++){ let gn=colBase+br+j; if(gn>=d.Nvox){ continue; }
+      outp[gm*d.Nvox+gn]=f16(acc[i*8u+j]); } }
+}`; }
+
+let device;
+async function init(){
+  if(!navigator.gpu){ log('no WebGPU'); POST({error:'no webgpu'}); return false; }
+  const adapter = await navigator.gpu.requestAdapter({powerPreference:'high-performance'});
+  const feats=[]; if(PREC==='f16' && adapter.features.has('shader-f16')) feats.push('shader-f16');
+  const lim=adapter.limits;
+  device = await adapter.requestDevice({requiredFeatures:feats, requiredLimits:{
+    maxBufferSize: lim.maxBufferSize,
+    maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize }});
+  const info = adapter.info || {};
+  log(`WebGPU ready | prec=${PREC} | f16=${adapter.features.has('shader-f16')} | ${info.vendor||''} ${info.architecture||''} ${info.description||''}`);
+  return true;
+}
+
+function buf(size, usage){ return device.createBuffer({size, usage}); }
+const U=GPUBufferUsage;
+
+async function runConv(shaderSrc, kind, dims, inpF32, wgtF32, iters){
+  const {Ci,Co,D,H,W}=dims; const Nvox=D*H*W, K=Ci*27;
+  // dispatch grid (2D/3D to stay under 65535 per dim) + aux field
+  let wg, aux;
+  if(kind==='naive'){ const nWG=Math.ceil(Co*Nvox/64); const gx=Math.min(65535,nWG); wg=[gx,Math.ceil(nWG/gx),1]; aux=gx; }
+  else { let TM=64,TN=64; if(kind==='tiledV8'){TM=128;TN=128;} else if(kind==='tiledVsm'){TM=32;TN=128;}
+    const nN=Math.ceil(Nvox/TN); const gx=Math.min(65535,nN); wg=[gx,Math.ceil(Co/TM),Math.ceil(nN/gx)]; aux=gx; }
+  const bytes = PREC==='f16'?2:4;
+  const toGPU = (arr)=>{ // arr is Float32Array; convert to f16 bits if needed
+    if(PREC==='f32') return arr;
+    const u=new Uint16Array(arr.length); for(let i=0;i<arr.length;i++) u[i]=f32tof16(arr[i]); return u;
+  };
+  const inpB=buf(inpF32.length*bytes, U.STORAGE|U.COPY_DST);
+  const wgtB=buf(wgtF32.length*bytes, U.STORAGE|U.COPY_DST);
+  const outN=Co*Nvox; const outB=buf(outN*bytes, U.STORAGE|U.COPY_SRC);
+  device.queue.writeBuffer(inpB,0, toGPU(inpF32)); device.queue.writeBuffer(wgtB,0, toGPU(wgtF32));
+  const uni=buf(32, U.UNIFORM|U.COPY_DST);
+  device.queue.writeBuffer(uni,0,new Uint32Array([Ci,Co,D,H,W,K,Nvox,aux]));
+  const mod=device.createShaderModule({code:(PREC==='f16'?'enable f16;\n':'')+shaderSrc});
+  const pipe=device.createComputePipeline({layout:'auto',compute:{module:mod,entryPoint:'main'}});
+  const bg=device.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[
+    {binding:0,resource:{buffer:inpB}},{binding:1,resource:{buffer:wgtB}},
+    {binding:2,resource:{buffer:outB}},{binding:3,resource:{buffer:uni}}]});
+  const dispatch=(enc)=>{ const p=enc.beginComputePass(); p.setPipeline(pipe); p.setBindGroup(0,bg);
+    p.dispatchWorkgroups(wg[0],wg[1],wg[2]); p.end(); };
+  // warm
+  { const e=device.createCommandEncoder(); dispatch(e); device.queue.submit([e.finish()]); await device.queue.onSubmittedWorkDone(); }
+  const times=[];
+  for(let it=0; it<iters; it++){ const t0=performance.now();
+    const e=device.createCommandEncoder(); dispatch(e); device.queue.submit([e.finish()]);
+    await device.queue.onSubmittedWorkDone(); times.push(performance.now()-t0); }
+  times.sort((a,b)=>a-b); const med=times[times.length>>1];
+  // read back output (f32 for validation)
+  const rb=buf(outN*bytes, U.MAP_READ|U.COPY_DST);
+  const e=device.createCommandEncoder(); e.copyBufferToBuffer(outB,0,rb,0,outN*bytes); device.queue.submit([e.finish()]);
+  await rb.mapAsync(GPUMapMode.READ); const raw=rb.getMappedRange().slice(0); rb.unmap();
+  let out; if(PREC==='f16'){ const u=new Uint16Array(raw); out=new Float32Array(u.length); for(let i=0;i<u.length;i++) out[i]=f16tof32(u[i]); } else out=new Float32Array(raw);
+  [inpB,wgtB,outB,uni,rb].forEach(b=>b.destroy());
+  const gmacs = Co*Ci*27*Nvox; const gflops = 2*gmacs/(med/1000)/1e9;
+  return {med, gflops, out};
+}
+
+// fp16 <-> fp32 bit conversion
+const f32tof16=(()=>{const b=new ArrayBuffer(4),f=new Float32Array(b),i=new Uint32Array(b);
+  return x=>{f[0]=x;const bits=i[0];const s=(bits>>>16)&0x8000;let e=(bits>>>23)&0xff;let m=bits&0x7fffff;
+    if(e===255)return s|0x7c00|(m?0x200:0); e=e-127+15; if(e>=31)return s|0x7c00;
+    if(e<=0){ if(e<-10)return s; m|=0x800000; return s|(m>>>(14-e)); } return s|(e<<10)|(m>>>13);};})();
+const f16tof32=(h)=>{const s=(h&0x8000)?-1:1;const e=(h>>10)&0x1f;const m=h&0x3ff;
+  if(e===0)return s*Math.pow(2,-14)*(m/1024); if(e===31)return m?NaN:s*Infinity; return s*Math.pow(2,e-15)*(1+m/1024);};
+
+function jsRef(dims,inp,wgt){ const {Ci,Co,D,H,W}=dims,HW=H*W,N=D*HW,out=new Float32Array(Co*N);
+  for(let co=0;co<Co;co++)for(let z=0;z<D;z++)for(let y=0;y<H;y++)for(let x=0;x<W;x++){let a=0;
+    for(let ci=0;ci<Ci;ci++)for(let kz=0;kz<3;kz++){const iz=z+kz-1;if(iz<0||iz>=D)continue;
+      for(let ky=0;ky<3;ky++){const iy=y+ky-1;if(iy<0||iy>=H)continue;
+        for(let kx=0;kx<3;kx++){const ix=x+kx-1;if(ix<0||ix>=W)continue;
+          a+=inp[((ci*D+iz)*H+iy)*W+ix]*wgt[((co*Ci+ci)*27)+(kz*9+ky*3+kx)];}}}
+    out[(co*D+z)*HW+ (y*W+x)]=a;}
+  return out; }
+
+const rand=(n)=>{const a=new Float32Array(n);for(let i=0;i<n;i++)a[i]=(Math.random()*2-1);return a;};
+const maxdiff=(a,b)=>{let m=0;for(let i=0;i<a.length;i++){const d=Math.abs(a[i]-b[i]);if(d>m)m=d;}return m;};
+
+(async()=>{
+  if(!(await init())) return;
+  // ---- correctness on a small shape ----
+  const sd={Ci:4,Co:4,D:8,H:8,W:8}; const si=rand(sd.Ci*sd.D*sd.H*sd.W), sw=rand(sd.Co*sd.Ci*27);
+  const ref=jsRef(sd,si,sw);
+  const sc=PREC==='f16'?'f16':'f32';
+  const rn=await runConv(naiveWGSL(sc), 'naive', sd, si, sw, 1);
+  const rt=await runConv(tiledWGSL(sc), 'tiled', sd, si, sw, 1);
+  const tol=PREC==='f16'?0.2:1e-3;
+  let ok = maxdiff(rn.out,ref)<tol && maxdiff(rt.out,ref)<tol;
+  let msg=`correctness: naive ${maxdiff(rn.out,ref).toExponential(2)} | tiled ${maxdiff(rt.out,ref).toExponential(2)}`;
+  if(PREC==='f16'){ const rv=await runConv(tiledVWGSL(), 'tiled', sd, si, sw, 1);
+    const rsm=await runConv(tiledVsmWGSL(), 'tiledVsm', sd, si, sw, 1);
+    msg+=` | tiledV ${maxdiff(rv.out,ref).toExponential(2)} | tiledVsm ${maxdiff(rsm.out,ref).toExponential(2)}`;
+    ok = ok && maxdiff(rv.out,ref)<tol && maxdiff(rsm.out,ref)<tol; }
+  log(msg+` (tol ${tol})`); log(ok?'CORRECT ✓':'MISMATCH ✗');
+
+  // ---- benchmark at real per-click 192^3 layer shapes ----
+  const shapes=[
+    {name:'S2  48^3 128->128', Ci:128,Co:128,D:48,H:48,W:48},
+    {name:'S3  24^3 256->256', Ci:256,Co:256,D:24,H:24,W:24},
+    {name:'dec 96^3 32->32',   Ci:32, Co:32, D:96,H:96,W:96},
+    {name:'dec 192^3 16->16',  Ci:16, Co:16, D:192,H:192,W:192},
+  ];
+  const results=[];
+  for(const s of shapes){
+    const inp=rand(s.Ci*s.D*s.H*s.W), wgt=rand(s.Co*s.Ci*27);
+    const n=await runConv(naiveWGSL(sc), 'naive', s, inp, wgt, 5);
+    const t=await runConv(tiledWGSL(sc), 'tiled', s, inp, wgt, 5);
+    let vGF=0,vMs=0,smGF=0,smMs=0;
+    if(PREC==='f16'){ const v=await runConv(tiledVWGSL(), 'tiled', s, inp, wgt, 5); vGF=v.gflops; vMs=v.med;
+      const sm=await runConv(tiledVsmWGSL(), 'tiledVsm', s, inp, wgt, 5); smGF=sm.gflops; smMs=sm.med; }
+    const bestGF=Math.max(vGF,smGF), bestMs=(vGF>=smGF?vMs:smMs), bestK=(vGF>=smGF?'V4':'Vsm');
+    log(`${s.name}: naive ${n.gflops.toFixed(0)}`
+        + (PREC==='f16'?` | V4 ${vGF.toFixed(0)} | Vsm ${smGF.toFixed(0)} -> BEST ${bestGF.toFixed(0)} GF/s (${bestK}, ${(n.med/bestMs).toFixed(1)}x, ${bestMs.toFixed(1)}ms)`:''));
+    results.push({name:s.name, naiveGF:n.gflops, V4GF:vGF, VsmGF:smGF, bestGF, bestMs, bestK});
+  }
+  POST({prec:PREC, correct:ok, results});
+  log('\nDONE');
+})();
+</script>

@@ -1,0 +1,50 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SAM-Med3D WebGPU self-test</title>
+<body style="font:14px ui-monospace,monospace;padding:1rem;white-space:pre-wrap" id="out">starting…
+<script type="module">
+const out=document.getElementById('out');
+const log=s=>{out.textContent+='\n'+s; console.log(s);};
+const done=(ok)=>{ window.__RESULT__ = ok?'PASS':'FAIL'; log(ok?'\n=== SELFTEST PASS ===':'\n=== SELFTEST FAIL ===');
+  try{ fetch('/selftest_result',{method:'POST',body:JSON.stringify({result:ok?'PASS':'FAIL',log:out.textContent})}); }catch(e){} };
+const B='models/sammed3d/', R=B+'ref/';
+async function f32(name){ const ab=await (await fetch(R+name+'.f32')).arrayBuffer(); return new Float32Array(ab); }
+try{
+  if(!navigator.gpu) throw 'no WebGPU';
+  const ort=await import('./ort/ort.webgpu.bundle.min.mjs');
+  ort.env.wasm.wasmPaths=location.origin+'/ort/';
+  ort.env.logLevel='error';
+  ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(8,navigator.hardwareConcurrency||4) : 1;
+  const shapes=await (await fetch(R+'shapes.json')).json();
+  const [img,emb,pc,pl,pm,hm,low]=await Promise.all(['img','emb','pc','pl','pm','hm','low'].map(f32));
+  const maxabs=(a,b)=>{let m=0;for(let i=0;i<a.length;i++){const d=Math.abs(a[i]-b[i]);if(d>m)m=d;}return m;};
+
+  log('loading decoder on WebGPU (+wasm fallback)…');
+  let t=performance.now();
+  const dec=await ort.InferenceSession.create(B+'decoder.onnx',{executionProviders:['webgpu','wasm']});
+  log('decoder loaded '+Math.round(performance.now()-t)+'ms; running…');
+  t=performance.now();
+  const dr=await dec.run({
+    image_embeddings:new ort.Tensor('float32',emb,shapes.emb),
+    point_coords:new ort.Tensor('float32',pc,shapes.pc),
+    point_labels:new ort.Tensor('float32',pl,shapes.pl),
+    prev_mask:new ort.Tensor('float32',pm,shapes.pm),
+    has_mask:new ort.Tensor('float32',hm,shapes.hm)});
+  await (ort.env.webgpu.device?ort.env.webgpu.device.queue.onSubmittedWorkDone():0);
+  const dlow=dr['low_res_logits'].data;
+  const derr=maxabs(dlow,low);
+  const sign=(()=>{let n=0;for(let i=0;i<low.length;i++)if((dlow[i]>0)===(low[i]>0))n++;return n/low.length;})();
+  log(`decoder webgpu: run ${Math.round(performance.now()-t)}ms  max|diff vs torch| ${derr.toExponential(2)}  mask-sign-agree ${(sign*100).toFixed(2)}%`);
+
+  log('\nloading encoder on wasm…');
+  t=performance.now();
+  const enc=await ort.InferenceSession.create(B+'encoder.onnx',{executionProviders:['wasm']});
+  log('encoder loaded '+Math.round(performance.now()-t)+'ms; running…');
+  t=performance.now();
+  const er=await enc.run({image:new ort.Tensor('float32',img,shapes.img)});
+  const eerr=maxabs(er['image_embeddings'].data,emb);
+  log(`encoder wasm: run ${Math.round(performance.now()-t)}ms  max|diff vs torch| ${eerr.toExponential(2)}`);
+
+  done(derr<2e-2 && sign>0.999 && eerr<2e-2);   // fp32 webgpu tolerances
+}catch(e){ log('ERROR: '+(e&&e.message||e)+'\n'+(e&&e.stack||'')); done(false); }
+</script>

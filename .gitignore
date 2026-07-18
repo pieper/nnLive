@@ -30,3 +30,12 @@ training/cache/
 *.swp
 .idea/
 .vscode/
+
+# WGSL pipeline: large model/data binaries (regenerable; publish to CORS bucket)
+*.weights.bin
+*.bin
+*.f32
+*.wasm
+livemodule/probe/ort/
+livemodule/probe/real/
+livemodule/probe/models/

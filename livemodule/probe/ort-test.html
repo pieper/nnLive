@@ -1,0 +1,104 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nnLive — ORT-Web WebGPU test (nnInteractive 192³ net)</title>
+<style>
+  body { font: 14px/1.5 -apple-system, system-ui, sans-serif; max-width: 820px; margin: 2rem auto; padding: 0 1rem; }
+  #log { white-space: pre-wrap; background: #f6f6f6; padding: 12px; border-radius: 6px; font-family: ui-monospace, monospace; font-size: 13px; }
+  .pass { color: #0a7d28; font-weight: 600; } .fail { color: #c0242b; font-weight: 600; }
+  h1 { font-size: 20px; }
+</style>
+<h1>nnLive — ORT-Web WebGPU test</h1>
+<p>Runs the exported <b>nnInteractive 192³ network</b> (fp16 weights, fp32 I/O, 102 M params) through
+ONNX Runtime Web on the <b>WebGPU</b> backend, in this browser. Measures session-create + per-forward
+latency and watches for CPU fallback. Results POST back to the nnLive session automatically.</p>
+<div id="log">starting…</div>
+
+<script type="module">
+const logEl = document.getElementById('log');
+const lines = [];
+const log = (s) => { lines.push(s); logEl.textContent = lines.join('\n'); console.log(s); };
+
+// Capture ORT warnings (used to spot CPU fallback / unsupported nodes).
+const warnings = [];
+const origWarn = console.warn, origErr = console.error;
+console.warn = (...a) => { warnings.push('WARN ' + a.join(' ')); origWarn(...a); };
+console.error = (...a) => { warnings.push('ERR ' + a.join(' ')); origErr(...a); };
+
+const post = async (obj) => { try { await fetch('/ort', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(obj,null,2)}); } catch(e){} };
+
+const VER = '1.27.0';
+const CDN = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${VER}/dist/`;
+
+async function main() {
+  const MODEL = 'net_192_webgpu_fp16.onnx';  // FULL WebGPU-native teacher (AvgPool+ConvTranspose fixed)
+  const report = { ok:false, ortVersion:VER, model:MODEL };
+  try {
+    log('loading onnxruntime-web (webgpu) from CDN…');
+    const ort = await import(CDN + 'ort.webgpu.min.mjs');
+    ort.env.wasm.wasmPaths = CDN;
+    ort.env.logLevel = 'warning';
+    log('ort loaded. creating InferenceSession on WebGPU (downloads + compiles 205 MB model — can take 20-60 s)…');
+
+    const t0 = performance.now();
+    const session = await ort.InferenceSession.create(MODEL, {
+      executionProviders: ['webgpu'],
+      graphOptimizationLevel: 'all',
+    });
+    const createMs = performance.now() - t0;
+    report.sessionCreateMs = Math.round(createMs);
+    log(`session created in ${(createMs/1000).toFixed(1)} s`);
+    log(`inputs=${session.inputNames}  outputs=${session.outputNames}`);
+
+    const inName = session.inputNames[0], outName = session.outputNames[0];
+    const dims = [1, 8, 192, 192, 192];
+    const n = dims.reduce((a,b)=>a*b, 1);
+    log(`allocating input tensor ${dims.join('x')} (${(n*4/1e6).toFixed(0)} MB fp32)…`);
+    const data = new Float32Array(n); // zeros — this is a latency/coverage test, not a correctness test
+    const feeds = { [inName]: new ort.Tensor('float32', data, dims) };
+
+    log('warm-up run (first run compiles WebGPU pipelines)…');
+    const w0 = performance.now();
+    let out = await session.run(feeds);
+    const warmMs = performance.now() - w0;
+    report.warmupMs = Math.round(warmMs);
+    log(`warm-up forward: ${(warmMs/1000).toFixed(2)} s  output=${outName} ${out[outName].dims.join('x')}`);
+
+    const runs = [];
+    for (let i=0;i<1;i++) {   // lean: single timed forward to minimize memory time on the 16GB Mac
+      const r0 = performance.now();
+      out = await session.run(feeds);
+      const ms = performance.now() - r0;
+      runs.push(Math.round(ms));
+      log(`forward #${i+1}: ${(ms/1000).toFixed(3)} s`);
+    }
+    report.runsMs = runs;
+    report.steadyMs = Math.round(runs.reduce((a,b)=>a+b,0)/runs.length);
+    report.outputDims = out[outName].dims;
+    report.ok = true;
+    try { await session.release(); log('session released'); } catch(e){}
+
+    // Fallback heuristic: WebGPU 192³ conv should be sub-few-seconds; CPU fallback would be tens of s.
+    const cpuFallbackSuspected = report.steadyMs > 8000;
+    report.cpuFallbackSuspected = cpuFallbackSuspected;
+    report.warnings = warnings.slice(0, 40);
+
+    log('');
+    log(`RESULT: steady-state forward ≈ ${(report.steadyMs/1000).toFixed(2)} s/pass`);
+    log(cpuFallbackSuspected
+        ? '⚠ latency high — possible CPU fallback for some ops (check warnings).'
+        : '✓ latency consistent with full WebGPU execution.');
+    logEl.insertAdjacentHTML('beforeend',
+      `\n\n<span class="${report.ok && !cpuFallbackSuspected ? 'pass':'fail'}">` +
+      `${report.ok && !cpuFallbackSuspected ? '✓ ORT-Web WebGPU ran the full nnInteractive network' : '⚠ ran, but review latency/fallback'}` +
+      `</span>`);
+  } catch(e) {
+    report.error = String(e && e.message || e);
+    report.warnings = warnings.slice(0, 40);
+    log('\n<FAILED> ' + report.error);
+    logEl.insertAdjacentHTML('beforeend', `\n<span class="fail">✗ ${report.error}</span>`);
+  }
+  await post(report);
+  log('\n(results sent back to nnLive session)');
+}
+main();
+</script>

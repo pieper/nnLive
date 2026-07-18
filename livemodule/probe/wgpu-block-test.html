@@ -1,0 +1,145 @@
+<!doctype html>
+<meta charset="utf-8"><title>WGSL bypass runtime — Conv3D+InstanceNorm+LeakyReLU block validation</title>
+<body style="font:13px ui-monospace,monospace;white-space:pre-wrap;padding:1rem" id="o">
+<script type="module">
+// Scaffold of the custom WGSL bypass runtime: GPU tensors + core nnU-Net op kernels, chained in ONE
+// command encoder (batched dispatch = no per-op JS round-trip). Validates a Conv3D->InstanceNorm3D->LeakyReLU
+// block vs a JS reference. This is the nucleus of the full per-click pipeline.
+const o=document.getElementById('o'); const log=s=>{o.textContent+=s+'\n';};
+const POST=(x)=>{try{fetch('/wgpu_block_result',{method:'POST',body:JSON.stringify(x)});}catch(e){}};
+const U=GPUBufferUsage;
+
+// ---- fp16 <-> fp32 ----
+const f32tof16=(()=>{const b=new ArrayBuffer(4),f=new Float32Array(b),i=new Uint32Array(b);
+  return x=>{f[0]=x;const bits=i[0];const s=(bits>>>16)&0x8000;let e=(bits>>>23)&0xff;let m=bits&0x7fffff;
+    if(e===255)return s|0x7c00|(m?0x200:0);e=e-127+15;if(e>=31)return s|0x7c00;
+    if(e<=0){if(e<-10)return s;m|=0x800000;return s|(m>>>(14-e));}return s|(e<<10)|(m>>>13);};})();
+const f16tof32=(h)=>{const s=(h&0x8000)?-1:1;const e=(h>>10)&0x1f;const m=h&0x3ff;
+  if(e===0)return s*Math.pow(2,-14)*(m/1024);if(e===31)return m?NaN:s*Infinity;return s*Math.pow(2,e-15)*(1+m/1024);};
+const toF16=(a)=>{const u=new Uint16Array(a.length);for(let i=0;i<a.length;i++)u[i]=f32tof16(a[i]);return u;};
+const fromF16=(u)=>{const a=new Float32Array(u.length);for(let i=0;i<u.length;i++)a[i]=f16tof32(u[i]);return a;};
+
+let dev;
+async function init(){
+  const ad=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});
+  dev=await ad.requestDevice({requiredFeatures:['shader-f16'],
+    requiredLimits:{maxBufferSize:ad.limits.maxBufferSize,maxStorageBufferBindingSize:ad.limits.maxStorageBufferBindingSize}});
+  log('device ready ('+(ad.info?.description||'')+')');
+}
+const mkbuf=(n,usage)=>dev.createBuffer({size:n,usage});
+function upload(f32arr){ const u=toF16(f32arr); const b=mkbuf(u.byteLength,U.STORAGE|U.COPY_DST); dev.queue.writeBuffer(b,0,u); return b; }
+async function download(buf,n){ const rb=mkbuf(n*2,U.MAP_READ|U.COPY_DST);
+  const e=dev.createCommandEncoder(); e.copyBufferToBuffer(buf,0,rb,0,n*2); dev.queue.submit([e.finish()]);
+  await rb.mapAsync(GPUMapMode.READ); const u=new Uint16Array(rb.getMappedRange().slice(0)); rb.unmap(); return fromF16(u); }
+
+const pcache=new Map();
+function pipe(src){ if(pcache.has(src))return pcache.get(src);
+  const m=dev.createShaderModule({code:'enable f16;\n'+src});
+  const p=dev.createComputePipeline({layout:'auto',compute:{module:m,entryPoint:'main'}}); pcache.set(src,p); return p; }
+function pass(enc,src,binds,wg){ const p=pipe(src);
+  const bg=dev.createBindGroup({layout:p.getBindGroupLayout(0),entries:binds.map((b,i)=>({binding:i,resource:{buffer:b}}))});
+  const cp=enc.beginComputePass(); cp.setPipeline(p); cp.setBindGroup(0,bg); cp.dispatchWorkgroups(wg[0],wg[1]||1,wg[2]||1); cp.end(); }
+const uni=(arr)=>{ const b=mkbuf(Math.max(16,arr.length*4),U.UNIFORM|U.COPY_DST); dev.queue.writeBuffer(b,0,new Uint32Array(arr)); return b; }
+
+// ---- op: Conv3D (V4 vec4 register-blocked, no bias), records into enc, returns out buffer ----
+const CONV_V4=`
+struct Dims{Ci:u32,Co:u32,D:u32,H:u32,W:u32,K:u32,Nvox:u32,aux:u32};
+@group(0)@binding(0) var<storage,read> inp:array<f16>; @group(0)@binding(1) var<storage,read> wgt:array<f16>;
+@group(0)@binding(2) var<storage,read_write> outp:array<f16>; @group(0)@binding(3) var<uniform> d:Dims;
+var<workgroup> As:array<vec4<f16>,256>; var<workgroup> Bs:array<vec4<f16>,256>;
+fn gB(gk:u32,oz:u32,oy:u32,ox:u32)->f16{ if(gk>=d.K){return f16(0);} let ci=gk/27u;let tap=gk%27u;
+  let kz=tap/9u;let ky=(tap/3u)%3u;let kx=tap%3u; let iz=i32(oz)+i32(kz)-1;let iy=i32(oy)+i32(ky)-1;let ix=i32(ox)+i32(kx)-1;
+  if(iz<0||iz>=i32(d.D)||iy<0||iy>=i32(d.H)||ix<0||ix>=i32(d.W)){return f16(0);}
+  return inp[((ci*d.D+u32(iz))*d.H+u32(iy))*d.W+u32(ix)]; }
+@compute @workgroup_size(16,16)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let tid=lid.y*16u+lid.x; let rowBase=wid.y*64u; let ntile=wid.z*d.aux+wid.x; let colBase=ntile*64u;
+  let HW=d.H*d.W; let Ktiles=(d.K+15u)/16u; let ar=lid.y*4u; let br=lid.x*4u;
+  var acc:array<f32,16>; for(var i=0u;i<16u;i++){acc[i]=0.0;}
+  for(var kk:u32=0u;kk<Ktiles;kk++){
+    { let m=tid/4u;let k4=tid%4u;let gm=rowBase+m;let base=kk*16u+k4*4u; var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gm<d.Co){let ofs=gm*d.K+base; if(base<d.K){v.x=wgt[ofs];} if(base+1u<d.K){v.y=wgt[ofs+1u];} if(base+2u<d.K){v.z=wgt[ofs+2u];} if(base+3u<d.K){v.w=wgt[ofs+3u];}} As[tid]=v; }
+    { let n=tid/4u;let k4=tid%4u;let gn=colBase+n;let base=kk*16u+k4*4u; var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gn<d.Nvox){let oz=gn/HW;let rem=gn%HW;let oy=rem/d.W;let ox=rem%d.W; v.x=gB(base,oz,oy,ox);v.y=gB(base+1u,oz,oy,ox);v.z=gB(base+2u,oz,oy,ox);v.w=gB(base+3u,oz,oy,ox);} Bs[tid]=v; }
+    workgroupBarrier();
+    for(var k4=0u;k4<4u;k4++){ let a0=As[(ar+0u)*4u+k4];let a1=As[(ar+1u)*4u+k4];let a2=As[(ar+2u)*4u+k4];let a3=As[(ar+3u)*4u+k4];
+      let b0=Bs[(br+0u)*4u+k4];let b1=Bs[(br+1u)*4u+k4];let b2=Bs[(br+2u)*4u+k4];let b3=Bs[(br+3u)*4u+k4];
+      acc[0]+=f32(dot(a0,b0));acc[1]+=f32(dot(a0,b1));acc[2]+=f32(dot(a0,b2));acc[3]+=f32(dot(a0,b3));
+      acc[4]+=f32(dot(a1,b0));acc[5]+=f32(dot(a1,b1));acc[6]+=f32(dot(a1,b2));acc[7]+=f32(dot(a1,b3));
+      acc[8]+=f32(dot(a2,b0));acc[9]+=f32(dot(a2,b1));acc[10]+=f32(dot(a2,b2));acc[11]+=f32(dot(a2,b3));
+      acc[12]+=f32(dot(a3,b0));acc[13]+=f32(dot(a3,b1));acc[14]+=f32(dot(a3,b2));acc[15]+=f32(dot(a3,b3)); }
+    workgroupBarrier();
+  }
+  for(var i=0u;i<4u;i++){let gm=rowBase+ar+i; if(gm>=d.Co){continue;}
+    for(var j=0u;j<4u;j++){let gn=colBase+br+j; if(gn>=d.Nvox){continue;} outp[gm*d.Nvox+gn]=f16(acc[i*4u+j]);}}
+}`;
+function conv3d(enc,x,w,{Ci,Co,D,H,W}){ const Nvox=D*H*W,K=Ci*27; const out=mkbuf(Co*Nvox*2,U.STORAGE|U.COPY_SRC);
+  const nN=Math.ceil(Nvox/64),gx=Math.min(65535,nN); const u=uni([Ci,Co,D,H,W,K,Nvox,gx]);
+  pass(enc,CONV_V4,[x,w,out,u],[gx,Math.ceil(Co/64),Math.ceil(nN/gx)]); return out; }
+
+// ---- op: InstanceNorm3D stats (mean, invstd per channel) ----
+const IN_STATS=`
+struct P{C:u32,N:u32}; @group(0)@binding(0) var<storage,read> x:array<f16>;
+@group(0)@binding(1) var<storage,read_write> stats:array<f32>; @group(0)@binding(2) var<uniform> p:P;
+var<workgroup> ss:array<f32,256>; var<workgroup> sq:array<f32,256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let c=wid.x; let base=c*p.N; var s=0.0; var q=0.0;
+  for(var i=lid.x;i<p.N;i+=256u){ let v=f32(x[base+i]); s+=v; q+=v*v; }
+  ss[lid.x]=s; sq[lid.x]=q; workgroupBarrier();
+  for(var st=128u;st>0u;st>>=1u){ if(lid.x<st){ss[lid.x]+=ss[lid.x+st];sq[lid.x]+=sq[lid.x+st];} workgroupBarrier(); }
+  if(lid.x==0u){ let m=ss[0]/f32(p.N); let vr=sq[0]/f32(p.N)-m*m; stats[c*2u]=m; stats[c*2u+1u]=inverseSqrt(max(vr,0.0)+1e-5); }
+}`;
+// ---- op: InstanceNorm apply + affine + LeakyReLU (fused) ----
+const IN_APPLY=`
+struct P{C:u32,N:u32,gx:u32}; @group(0)@binding(0) var<storage,read> x:array<f16>;
+@group(0)@binding(1) var<storage,read> stats:array<f32>; @group(0)@binding(2) var<storage,read> scale:array<f16>;
+@group(0)@binding(3) var<storage,read> bias:array<f16>; @group(0)@binding(4) var<storage,read_write> y:array<f16>;
+@group(0)@binding(5) var<uniform> p:P;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let idx=(wid.y*p.gx+wid.x)*256u+lid.x; let total=p.C*p.N; if(idx>=total){return;} let c=idx/p.N;
+  let v=(f32(x[idx])-stats[c*2u])*stats[c*2u+1u]*f32(scale[c])+f32(bias[c]);
+  y[idx]=f16(select(v*0.01, v, v>0.0));
+}`;
+function instanceNormLeaky(enc,x,scale,bias,C,N){
+  const stats=mkbuf(C*2*4,U.STORAGE|U.COPY_DST); pass(enc,IN_STATS,[x,stats,uni([C,N])],[C,1,1]);
+  const total=C*N,nWG=Math.ceil(total/256),gx=Math.min(65535,nWG); const y=mkbuf(C*N*2,U.STORAGE|U.COPY_SRC);
+  pass(enc,IN_APPLY,[x,stats,scale,bias,y,uni([C,N,gx])],[gx,Math.ceil(nWG/gx),1]); return y; }
+
+// ---- JS reference ----
+function refBlock(x,w,scale,bias,Ci,Co,D,H,W){
+  const HW=H*W,N=D*HW; const c=new Float32Array(Co*N);
+  for(let co=0;co<Co;co++)for(let z=0;z<D;z++)for(let y=0;y<H;y++)for(let X=0;X<W;X++){let a=0;
+    for(let ci=0;ci<Ci;ci++)for(let kz=0;kz<3;kz++){const iz=z+kz-1;if(iz<0||iz>=D)continue;
+      for(let ky=0;ky<3;ky++){const iy=y+ky-1;if(iy<0||iy>=H)continue;
+        for(let kx=0;kx<3;kx++){const ix=X+kx-1;if(ix<0||ix>=W)continue;
+          a+=x[((ci*D+iz)*H+iy)*W+ix]*w[((co*Ci+ci)*27)+(kz*9+ky*3+kx)];}}}
+    c[(co*D+z)*HW+(y*W+X)]=a;}
+  const out=new Float32Array(Co*N);
+  for(let co=0;co<Co;co++){let m=0;for(let i=0;i<N;i++)m+=c[co*N+i];m/=N;let vr=0;for(let i=0;i<N;i++){const d=c[co*N+i]-m;vr+=d*d;}vr/=N;
+    const inv=1/Math.sqrt(vr+1e-5); for(let i=0;i<N;i++){let v=(c[co*N+i]-m)*inv*scale[co]+bias[co]; out[co*N+i]=v>0?v:0.01*v;}}
+  return out;
+}
+const rand=(n)=>{const a=new Float32Array(n);for(let i=0;i<n;i++)a[i]=Math.random()*2-1;return a;};
+const maxrel=(a,b)=>{let m=0;for(let i=0;i<a.length;i++){const d=Math.abs(a[i]-b[i]);if(d>m)m=d;}return m;};
+
+(async()=>{
+  await init();
+  const Ci=8,Co=16,D=16,H=16,W=16,N=D*H*W;
+  const x=rand(Ci*N),w=rand(Co*Ci*27),scale=rand(Co).map(v=>1+0.3*v),bias=rand(Co).map(v=>0.2*v);
+  const ref=refBlock(x,w,scale,bias,Ci,Co,D,H,W);
+  const xb=upload(x),wb=upload(w),sb=upload(scale),bb=upload(bias);
+  // build block in ONE encoder (batched)
+  const enc=dev.createCommandEncoder();
+  const cb=conv3d(enc,xb,wb,{Ci,Co,D,H,W});
+  const yb=instanceNormLeaky(enc,cb,sb,bb,Co,N);
+  dev.queue.submit([enc.finish()]); await dev.queue.onSubmittedWorkDone();
+  const got=await download(yb,Co*N);
+  const md=maxrel(got,ref);
+  log(`Conv3D->InstanceNorm3D->LeakyReLU block  max|diff| vs JS ref = ${md.toExponential(2)} (fp16 tol ~0.05)`);
+  log(md<0.05?'BLOCK CORRECT ✓ — runtime chaining works':'MISMATCH ✗');
+  POST({block:'conv+in+leaky', maxdiff:md, ok:md<0.05});
+  log('DONE');
+})();
+</script>

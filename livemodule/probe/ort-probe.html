@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nnLive — ORT-Web WebGPU op probe</title>
+<style>body{font:14px/1.5 system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem}
+#log{white-space:pre-wrap;background:#f6f6f6;padding:12px;border-radius:6px;font-family:ui-monospace,monospace;font-size:13px}
+.pass{color:#0a7d28;font-weight:600}.fail{color:#c0242b;font-weight:600}</style>
+<h1>ORT-Web WebGPU op probe — high-rank Transpose (pixel-shuffle)</h1>
+<p>Tiny (318-byte) model: Reshape → Transpose(8D, perm for 2×2×2 pixel-shuffle) → Reshape.
+Tests whether the WebGPU EP can run the interleave needed to replace ConvTranspose3d. Negligible memory.</p>
+<div id="log">starting…</div>
+<script type="module">
+const logEl=document.getElementById('log'), lines=[];
+const log=s=>{lines.push(s);logEl.textContent=lines.join('\n');console.log(s)};
+const warns=[]; const ow=console.warn,oe=console.error;
+console.warn=(...a)=>{warns.push('WARN '+a.join(' '));ow(...a)};
+console.error=(...a)=>{warns.push('ERR '+a.join(' '));oe(...a)};
+const post=async o=>{try{await fetch('/ortprobe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o,null,2)})}catch(e){}};
+const VER='1.27.0', CDN=`https://cdn.jsdelivr.net/npm/onnxruntime-web@${VER}/dist/`;
+async function main(){
+  const rep={ok:false,test:'transpose8d'};
+  try{
+    const ort=await import(CDN+'ort.webgpu.min.mjs');
+    ort.env.wasm.wasmPaths=CDN; ort.env.logLevel='warning';
+    log('creating session (webgpu only)…');
+    const sess=await ort.InferenceSession.create('probe_transpose8d.onnx',{executionProviders:['webgpu']});
+    const din=[1,16,4,4,4], n=din.reduce((a,b)=>a*b,1);
+    const feeds={[sess.inputNames[0]]:new ort.Tensor('float32',new Float32Array(n),din)};
+    const out=await sess.run(feeds);
+    const o=out[sess.outputNames[0]];
+    rep.ok=true; rep.outDims=o.dims;
+    log('✓ ran on WebGPU. output dims '+o.dims.join('x'));
+    logEl.insertAdjacentHTML('beforeend','\n<span class="pass">✓ WebGPU supports the 8D Transpose — pixel-shuffle rewrite is viable</span>');
+  }catch(e){
+    rep.error=String(e&&e.message||e); rep.warnings=warns.slice(0,20);
+    log('✗ '+rep.error);
+    logEl.insertAdjacentHTML('beforeend','\n<span class="fail">✗ '+rep.error+'</span>');
+  }
+  await post(rep); log('\n(result sent to nnLive session)');
+}
+main();
+</script>

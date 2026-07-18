@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8"><title>encoder thread test</title>
+<body style="font:13px ui-monospace,monospace;white-space:pre-wrap;padding:1rem" id="o">…
+<script type="module">
+const o=document.getElementById('o'); const log=s=>{o.textContent+='\n'+s;};
+const T=+(new URLSearchParams(location.search).get('t')||8);
+try{
+  const ort=await import('./ort/ort.webgpu.bundle.min.mjs');
+  ort.env.wasm.wasmPaths=location.origin+'/ort/'; ort.env.logLevel='error';
+  ort.env.wasm.numThreads=T;
+  log('numThreads='+T+' crossOriginIsolated='+self.crossOriginIsolated);
+  const crop=new Float32Array(await (await fetch('models/sammed3d/ref/realcrop.f32')).arrayBuffer());
+  const tref=new Float32Array(await (await fetch('models/sammed3d/ref/realemb.f32')).arrayBuffer());
+  const enc=await ort.InferenceSession.create('models/sammed3d/encoder.onnx',{executionProviders:['wasm']});
+  const runs=[];
+  for(let r=0;r<2;r++){
+    const out=await enc.run({image:new ort.Tensor('float32',crop.slice(),[1,1,128,128,128])});
+    const e=out['image_embeddings'].data;
+    let mx=0,dot=0,nn=0; for(let i=0;i<e.length;i++){const d=Math.abs(e[i]-tref[i]);if(d>mx)mx=d;dot+=e[i]*tref[i];nn+=e[i]*e[i];}
+    const std=Math.sqrt(nn/e.length);
+    // correlation
+    let mb=0,mt=0;for(let i=0;i<e.length;i++){mb+=e[i];mt+=tref[i];}mb/=e.length;mt/=e.length;
+    let cov=0,vb=0,vt=0;for(let i=0;i<e.length;i++){cov+=(e[i]-mb)*(tref[i]-mt);vb+=(e[i]-mb)**2;vt+=(tref[i]-mt)**2;}
+    const corr=cov/Math.sqrt(vb*vt);
+    runs.push({mx,std,corr});
+    log(`run ${r}: max|diff vs torch| ${mx.toFixed(3)}  emb std ${std.toFixed(3)}  corr ${corr.toFixed(4)}`);
+  }
+  const ok=runs.every(r=>r.corr>0.99 && r.mx<0.05);
+  o.textContent += ok?'\nPASS':'\nFAIL';
+  fetch('/encthread_result',{method:'POST',body:JSON.stringify({t:T,runs,ok,log:o.textContent})});
+}catch(e){ log('ERR '+(e.message||e)); fetch('/encthread_result',{method:'POST',body:JSON.stringify({t:T,error:String(e.message||e)})}); }
+</script>

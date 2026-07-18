@@ -1,0 +1,187 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nnLive — interactive click-local segmentation</title>
+<style>
+  body{font:14px/1.5 system-ui,sans-serif;max-width:1050px;margin:1rem auto;padding:0 1rem}
+  #sub{color:#444;min-height:1.4em}
+  .row{display:flex;gap:1.4rem;align-items:flex-start;flex-wrap:wrap}
+  canvas{image-rendering:pixelated;border:1px solid #bbb;border-radius:4px;background:#000;cursor:crosshair}
+  #log{white-space:pre-wrap;background:#f6f6f6;padding:8px 10px;border-radius:6px;font-family:ui-monospace,monospace;font-size:11.5px;max-height:60vh;overflow:auto;flex:1;min-width:280px}
+  button{font:inherit;padding:.25rem .7rem;border-radius:5px;border:1px solid #bbb;background:#fff;cursor:pointer}
+  .k{display:inline-block;padding:0 .35em;border:1px solid #ccc;border-radius:3px;background:#fafafa;font-family:ui-monospace,monospace}
+  .pass{color:#0a7d28;font-weight:600}.fail{color:#c0242b;font-weight:600}
+  b#lat{font-size:1.15em}
+</style>
+<h1>nnLive — interactive click-local segmentation</h1>
+<p id="sub">loading…</p>
+<p style="color:#555;margin:.2rem 0 .8rem">
+  <b>Left-click</b> = positive (grow) · <b>Shift-click</b> or <b>right-click</b> = negative (carve) ·
+  scroll or slider changes slice. Each click segments a 64³ window around it (~96&nbsp;mm) and merges into
+  the running mask — keep clicking to build up a whole structure. Last click: <b id="lat">—</b></p>
+<div class="row">
+  <div>
+    <canvas id="cv" width="480" height="480"></canvas>
+    <div style="margin-top:.4rem;display:flex;gap:.6rem;align-items:center;flex-wrap:wrap">
+      slice <input id="z" type="range" min="0" max="1" value="0" style="width:230px"> <span id="zv">0</span>
+      <button id="undo">undo</button><button id="clear">clear</button>
+      <label><input id="ov" type="checkbox" checked> mask</label>
+      <label><input id="rf" type="checkbox"> IDC seg</label>
+    </div>
+  </div>
+  <div id="log"></div>
+</div>
+<script type="module">
+const $=id=>document.getElementById(id);
+const logEl=$('log'), sub=$('sub'), lines=[];
+const log=s=>{lines.push(s);logEl.textContent=lines.join('\n');logEl.scrollTop=logEl.scrollHeight};
+const t0=performance.now(), clk=()=>((performance.now()-t0)/1000).toFixed(1)+'s';
+
+const P=+(new URLSearchParams(location.search).get('p')||64);
+const MODEL=new URLSearchParams(location.search).get('m')||'models/net_64_webgpu_fp16.onnx';
+
+let Z,Y,X, ct,vol,lab=null, mask, clicks=[], busy=false, ready=false, seq=0;
+const cv=$('cv'), cx=cv.getContext('2d');
+
+// small solid ball offsets for painting prompt points
+const ball=(r)=>{const o=[];for(let z=-r;z<=r;z++)for(let y=-r;y<=r;y++)for(let x=-r;x<=r;x++)if(x*x+y*y+z*z<=r*r)o.push([z,y,x]);return o;};
+const BALL2=ball(2);
+
+function draw(){
+  const z=+$('z').value; $('zv').textContent=z;
+  const img=cx.createImageData(X,Y), o=z*Y*X;
+  const showMask=$('ov').checked, showRef=$('rf').checked && lab;
+  for(let i=0;i<X*Y;i++){
+    const g=ct[o+i]; let r=g,gr=g,b=g;
+    if(showRef && lab[o+i]){ gr=(gr+150)>>1; }
+    if(showMask && mask[o+i]){ r=(r+255)>>1; gr=gr>>1; b=b>>1; }
+    const p=i*4; img.data[p]=r; img.data[p+1]=gr; img.data[p+2]=b; img.data[p+3]=255;
+  }
+  const tmp=new OffscreenCanvas(X,Y); tmp.getContext('2d').putImageData(img,0,0);
+  cx.imageSmoothingEnabled=false; cx.clearRect(0,0,cv.width,cv.height); cx.drawImage(tmp,0,0,cv.width,cv.height);
+  const sx=cv.width/X, sy=cv.height/Y;
+  for(const c of clicks){ if(c.z!==z) continue;
+    cx.strokeStyle=c.sign>0?'#00e0ff':'#ff3bd0'; cx.lineWidth=2;
+    const px=c.x*sx+sx/2, py=c.y*sy+sy/2;
+    cx.beginPath(); cx.moveTo(px-6,py); cx.lineTo(px+6,py); if(c.sign>0){cx.moveTo(px,py-6); cx.lineTo(px,py+6);} cx.stroke();
+  }
+}
+
+function patchLo(c){ const lo=[c.z,c.y,c.x].map((v,i)=>{const dim=[Z,Y,X][i]; return Math.max(0,Math.min(v-(P>>1), dim-P));}); return lo; }
+
+function buildInput(center){
+  const lo=patchLo(center), [z0,y0,x0]=lo, P3=P*P*P;
+  const inp=new Float32Array(8*P3);
+  // ch0 image (z-scored over the patch); ch1 prev-seg (accumulated mask)
+  let sum=0,sum2=0;
+  for(let z=0;z<P;z++)for(let y=0;y<P;y++)for(let x=0;x<P;x++){
+    const gv=vol[(z0+z)*Y*X+(y0+y)*X+(x0+x)], pi=z*P*P+y*P+x;
+    inp[pi]=gv; sum+=gv; sum2+=gv*gv;
+    if(mask[(z0+z)*Y*X+(y0+y)*X+(x0+x)]) inp[P3+pi]=1;   // ch1
+  }
+  const mean=sum/P3, std=Math.sqrt(Math.max(1e-6,sum2/P3-mean*mean));
+  for(let i=0;i<P3;i++) inp[i]=(inp[i]-mean)/std;
+  // ch4 positive points, ch5 negative points — every click that lands in this patch
+  for(const c of clicks){
+    const lz=c.z-z0, ly=c.y-y0, lx=c.x-x0;
+    if(lz<0||ly<0||lx<0||lz>=P||ly>=P||lx>=P) continue;
+    const ch=c.sign>0?4:5;
+    for(const [dz,dy,dx] of BALL2){ const z=lz+dz,y=ly+dy,x=lx+dx;
+      if(z<0||y<0||x<0||z>=P||y>=P||x>=P) continue;
+      inp[ch*P3 + z*P*P+y*P+x]=1; }
+  }
+  return {inp, lo};
+}
+
+// ---- "feel-fast" animation: a sensing pulse while computing, then an outward reveal of the mask ----
+let sensing=null;   // {x,y,z,t0}  radiating rings during compute
+let pending=null;   // {lm, lo, cx,cy,cz, maxR, t0}  outward reveal after result
+const REVEAL_MS=420;
+function commitPending(){
+  const {lm, lo:[z0,y0,x0]}=pending;
+  for(let z=0;z<P;z++)for(let y=0;y<P;y++)for(let x=0;x<P;x++)
+    mask[(z0+z)*Y*X+(y0+y)*X+(x0+x)]=lm[z*P*P+y*P+x];   // replace the patch box (prev-seg gives continuity)
+  pending=null;
+}
+function overlay(){
+  draw();                                                 // committed CT + mask + click markers
+  const z=+$('z').value, sx=cv.width/X, sy=cv.height/Y, now=performance.now();
+  if(sensing && sensing.z===z){                           // expanding dashed rings from the click
+    const el=now-sensing.t0;
+    cx.setLineDash([5,5]);
+    for(let k=0;k<3;k++){ const r=((el*0.09)+(k*22))%70; cx.strokeStyle=`rgba(0,224,255,${0.55-0.13*k})`; cx.lineWidth=2;
+      cx.beginPath(); cx.arc(sensing.x*sx+sx/2, sensing.y*sy+sy/2, r, 0, 7); cx.stroke(); }
+    cx.setLineDash([]);
+  }
+  if(pending){                                            // reveal the freshly-computed mask outward from the click
+    const el=now-pending.t0, frac=Math.min(1, el/REVEAL_MS), R=frac*pending.maxR, [z0,y0,x0]=pending.lo, lz=z-z0;
+    if(lz>=0&&lz<P){ cx.fillStyle='rgba(255,64,64,.82)';
+      for(let y=0;y<P;y++)for(let x=0;x<P;x++){ if(!pending.lm[lz*P*P+y*P+x]) continue;
+        const dz=z-pending.cz, dy=(y0+y)-pending.cy, dx=(x0+x)-pending.cx;
+        if(dz*dz+dy*dy+dx*dx<=R*R) cx.fillRect((x0+x)*sx,(y0+y)*sy,Math.ceil(sx),Math.ceil(sy)); } }
+    if(frac>=1){ commitPending(); busy=false; draw(); return; }   // done: bake in and stop
+  }
+  if(sensing||pending) requestAnimationFrame(overlay);
+}
+
+const worker=new Worker('interactive-worker.js?v=1',{type:'module'});
+worker.onmessage=(e)=>{
+  const {type,data}=e.data;
+  if(type==='ready'){ ready=true; sub.innerHTML=`<span class="pass">ready</span> — model ${data.model.split('/').pop()} @ ${P}³ · warmup ${(data.warmMs/1000).toFixed(1)}s (load ${(data.loadMs/1000).toFixed(1)}s). Click the CT to segment.`;
+    log(`[${clk()}] session ready: load ${data.loadMs}ms, warmup ${data.warmMs}ms`); }
+  else if(type==='result'){
+    const lm=new Uint8Array(data.mask), [z0,y0,x0]=data.lo, c=clicks[clicks.length-1];
+    // max distance from the click to a fg voxel in the patch -> reveal radius that covers the whole result
+    let maxR=1;
+    for(let z=0;z<P;z++)for(let y=0;y<P;y++)for(let x=0;x<P;x++){ if(!lm[z*P*P+y*P+x]) continue;
+      const dz=(z0+z)-c.z, dy=(y0+y)-c.y, dx=(x0+x)-c.x, d2=dz*dz+dy*dy+dx*dx; if(d2>maxR) maxR=d2; }
+    maxR=Math.sqrt(maxR)+1;
+    sensing=null;
+    pending={lm, lo:data.lo, cx:c.x,cy:c.y,cz:c.z, maxR, t0:performance.now()};
+    let tot=0; for(let i=0;i<mask.length;i++) tot+=mask[i];
+    $('lat').innerHTML=`<span class="pass">${data.runMs} ms</span> <span style="color:#888">+ reveal</span>`;
+    log(`[${clk()}] click ${data.seq}: compute ${data.runMs}ms · patch fg ${data.fg} · total ${tot} vox`);
+    requestAnimationFrame(overlay);
+  }
+  else if(type==='error'){ sub.innerHTML=`<span class="fail">✗ ${data}</span>`; log(`✗ ${data}`); busy=false; sensing=null; }
+};
+
+function onClick(ev){
+  if(!ready){ log('…not ready yet'); return; }
+  if(busy){ log('…busy, ignoring click'); return; }
+  ev.preventDefault();
+  const rect=cv.getBoundingClientRect();
+  const x=Math.floor((ev.clientX-rect.left)/(cv.width/X));
+  const y=Math.floor((ev.clientY-rect.top)/(cv.height/Y));
+  const z=+$('z').value;
+  const sign=(ev.shiftKey||ev.button===2)?-1:1;
+  clicks.push({z,y,x,sign});
+  busy=true; seq++;
+  const {inp,lo}=buildInput({z,y,x});
+  $('lat').innerHTML='<span style="color:#b26a00">…sensing</span>';
+  worker.postMessage({type:'infer', input:inp.buffer, lo, seq}, [inp.buffer]);
+  sensing={x,y,z,t0:performance.now()};      // start the sensing pulse immediately (instant feedback)
+  requestAnimationFrame(overlay);
+}
+
+(async ()=>{
+  if(!navigator.gpu){ sub.innerHTML='<span class="fail">no WebGPU</span>'; return; }
+  const meta=await (await fetch('real/full_meta.json')).json();
+  [Z,Y,X]=meta.shape;
+  sub.textContent=`loading volume ${Z}×${Y}×${X}…`;
+  ct=new Uint8Array(await (await fetch('real/full_ct_u8.bin')).arrayBuffer());
+  const vbuf=await (await fetch('real/full_vol_i16.bin')).arrayBuffer(); vol=new Int16Array(vbuf);
+  try{ lab=new Uint8Array(await (await fetch('real/full_lab_u8.bin')).arrayBuffer()); }catch(e){}
+  mask=new Uint8Array(Z*Y*X);
+  cv.width=cv.height=Math.min(560, Math.round(X*2.2)); cv.height=Math.round(cv.width*Y/X);
+  $('z').max=Z-1; $('z').value=Math.floor(Z/2);
+  $('z').addEventListener('input',draw); $('ov').addEventListener('change',draw); $('rf').addEventListener('change',draw);
+  cv.addEventListener('mousedown',onClick); cv.addEventListener('contextmenu',e=>e.preventDefault());
+  cv.addEventListener('wheel',e=>{e.preventDefault(); const z=Math.max(0,Math.min(Z-1,+$('z').value+(e.deltaY>0?1:-1))); $('z').value=z; draw();},{passive:false});
+  $('undo').onclick=()=>{ clicks.pop(); log('undo (note: mask not recomputed — clear to fully reset)'); draw(); };
+  $('clear').onclick=()=>{ clicks=[]; mask.fill(0); draw(); log('cleared'); };
+  draw();
+  sub.textContent='loading model…';
+  worker.postMessage({type:'init', modelUrl:new URL(MODEL,location.href).href, patch:P});
+  log(`[${clk()}] volume ${Z}×${Y}×${X} loaded; loading ${MODEL} …`);
+})();
+</script>

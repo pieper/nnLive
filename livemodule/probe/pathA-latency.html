@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8"><title>Path A — WebGPU click latency</title>
+<body style="font:13px ui-monospace,monospace;white-space:pre-wrap;padding:1rem" id="o">
+<script type="module">
+const o = document.getElementById('o'); const log = s => { o.textContent += '\n' + s; };
+const q = new URLSearchParams(location.search);
+const ep = q.get('ep') || 'webgpu', iters = +(q.get('iters') || 20), diag = q.has('diag'), profile = q.has('profile');
+const patch = +(q.get('p') || 128), gc = q.has('gc'), prec = q.get('prec') || 'fp16';
+log(`Path A latency — ep=${ep} p=${patch} gc=${gc} iters=${iters} COI=${self.crossOriginIsolated} gpu=${!!navigator.gpu}`);
+const w = new Worker('pathA-latency-worker.js?v=4', { type: 'module' });
+w.onmessage = (e) => {
+  const d = e.data;
+  if (d.log) { log(d.log); return; }
+  if (d.error) { log('ERROR: ' + d.error); try { fetch('/pathA_result', { method: 'POST', body: JSON.stringify({ ep, error: d.error }) }); } catch (x) {} return; }
+  if (d.done) {
+    log(`\n=== RESULT ep=${d.ep} patch=${d.patch}^3 ===`);
+    log(` model load        ${d.loadMs | 0} ms`);
+    log(` trunk encode-once ${d.trunkMs.toFixed(0)} ms`);
+    log(` perclick median   ${d.perclickMedianMs.toFixed(1)} ms   (min ${d.perclickMinMs.toFixed(1)} ms)`);
+    try { fetch('/pathA_result', { method: 'POST', body: JSON.stringify(d) }); } catch (x) {}
+  }
+};
+w.postMessage({ ep, iters, diag, profile, patch, gc, prec });
+</script>
