@@ -85,6 +85,13 @@ class PerClick(nn.Module):
 
 trunk = Trunk(pathA).eval(); perclick = PerClick(pathA, slim).eval()
 
+# fast mode: export ONLY perclick at P, tracing with ZERO inputs (skip slow trunk forward / validation / fp16)
+if len(sys.argv) > 2 and sys.argv[2] == "fast":
+    s0 = torch.zeros(1, 32, P, P, P); s1 = torch.zeros(1, 64, P // 2, P // 2, P // 2); inter = torch.zeros(1, 7, P, P, P)
+    torch.onnx.export(perclick, (s0, s1, inter), join(OUT, f"perclick{TAG}.onnx"),
+        input_names=["s0", "s1", "inter"], output_names=["logits"], opset_version=17, do_constant_folding=True, dynamo=False)
+    print(f"FAST: wrote perclick{TAG}.onnx"); sys.exit(0)
+
 # reference forward
 torch.manual_seed(0)
 img = torch.randn(1, 1, P, P, P); inter = (torch.rand(1, 7, P, P, P) > 0.98).float()
