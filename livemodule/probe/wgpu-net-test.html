@@ -2,7 +2,7 @@
 <meta charset="utf-8"><title>custom WGSL per-click pipeline — full-graph validation vs ORT</title>
 <body style="font:13px ui-monospace,monospace;white-space:pre-wrap;padding:1rem" id="o">
 <script type="module">
-import { initDevice, makeRunner, toF16, fromF16, U } from './wgpu-net.js?v=6';
+import { initDevice, makeRunner, toF16, fromF16, U } from './wgpu-net.js?v=7';
 const o=document.getElementById('o'); const log=s=>{o.textContent+=s+'\n'; console.log(s);};
 const POST=x=>{try{fetch('/wgpu_net_result',{method:'POST',body:JSON.stringify(x)});}catch(e){}};
 const P = +(new URLSearchParams(location.search).get('p')||64);
@@ -44,6 +44,7 @@ try{
       const Co=nd.Co,Ci=nd.Ci,OD=os[2],OH=os[3],OW=os[4],ID=is[2],IH=is[3],IW=is[4];
       const Nvox=OD*OH*OW,nN=Math.ceil(Nvox/64),gx=Math.min(65535,nN);
       const bias=nd.bias?W[nd.in[2]]:zeroBias(Co); const u=R.uni([Ci,Co,OD,OH,OW,ID,IH,IW,nd.K,nd.S,nd.pad,gx]);
+      // Vsm helps isolated low-channel 3x3 convs but net-hurts the full pipeline (decoder is mostly 1x1) -> V4 for all.
       plan.push(e=>R.pass(e,R.CONV,[inb[0],inb[1],bias,out,u],[gx,Math.ceil(Co/64),Math.ceil(nN/gx)]));
     } else if(nd.op==='InstanceNormalization'){
       const s=graph.tensors[nd.out[0]]; const C=s[1],N=s[2]*s[3]*s[4]; const stats=mkbuf(C*2*4);

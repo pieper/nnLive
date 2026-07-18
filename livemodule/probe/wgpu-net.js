@@ -54,6 +54,38 @@ fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:v
   for(var i=0u;i<4u;i++){let gm=rowBase+ar+i; if(gm>=d.Co){continue;}
     for(var j=0u;j<4u;j++){let gn=colBase+br+j; if(gn>=Nvox){continue;} outp[gm*Nvox+gn]=f16(acc[i*4u+j])+bias[gm];}}
 }`;
+// small-M conv variant (BM=32,BN=128,TM=2,TN=8) for low-channel high-res layers (decoder)
+const CONV_VSM = `
+struct D{Ci:u32,Co:u32,OD:u32,OH:u32,OW:u32,ID:u32,IH:u32,IW:u32,K:u32,S:u32,pad:u32,aux:u32};
+@group(0)@binding(0) var<storage,read> inp:array<f16>; @group(0)@binding(1) var<storage,read> wgt:array<f16>;
+@group(0)@binding(2) var<storage,read> bias:array<f16>; @group(0)@binding(3) var<storage,read_write> outp:array<f16>;
+@group(0)@binding(4) var<uniform> d:D;
+var<workgroup> As:array<vec4<f16>,128>; var<workgroup> Bs:array<vec4<f16>,512>;
+fn gB(gk:u32,oz:u32,oy:u32,ox:u32)->f16{ let taps=d.K*d.K*d.K; let ci=gk/taps; let tap=gk%taps;
+  let kz=tap/(d.K*d.K); let ky=(tap/d.K)%d.K; let kx=tap%d.K;
+  let iz=i32(oz*d.S)+i32(kz)-i32(d.pad); let iy=i32(oy*d.S)+i32(ky)-i32(d.pad); let ix=i32(ox*d.S)+i32(kx)-i32(d.pad);
+  if(iz<0||iz>=i32(d.ID)||iy<0||iy>=i32(d.IH)||ix<0||ix>=i32(d.IW)){return f16(0);}
+  return inp[((ci*d.ID+u32(iz))*d.IH+u32(iy))*d.IW+u32(ix)]; }
+@compute @workgroup_size(16,16)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let Nvox=d.OD*d.OH*d.OW; let Ktot=d.Ci*d.K*d.K*d.K; let Ktiles=(Ktot+15u)/16u;
+  let tid=lid.y*16u+lid.x; let rowBase=wid.y*32u; let ntile=wid.z*d.aux+wid.x; let colBase=ntile*128u;
+  let OHW=d.OH*d.OW; let ar=lid.y*2u; let br=lid.x*8u;
+  var acc:array<f32,16>; for(var i=0u;i<16u;i++){acc[i]=0.0;}
+  for(var kk:u32=0u;kk<Ktiles;kk++){
+    if(tid<128u){ let m=tid/4u;let k4=tid%4u;let gm=rowBase+m;let base=kk*16u+k4*4u; var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gm<d.Co){let o=gm*Ktot+base; if(base<Ktot){v.x=wgt[o];} if(base+1u<Ktot){v.y=wgt[o+1u];} if(base+2u<Ktot){v.z=wgt[o+2u];} if(base+3u<Ktot){v.w=wgt[o+3u];}} As[tid]=v; }
+    for(var li=0u;li<2u;li++){ let e=tid+li*256u;let n=e/4u;let k4=e%4u;let gn=colBase+n;let base=kk*16u+k4*4u; var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gn<Nvox){let oz=gn/OHW;let rem=gn%OHW;let oy=rem/d.OW;let ox=rem%d.OW; v.x=gB(base,oz,oy,ox);v.y=gB(base+1u,oz,oy,ox);v.z=gB(base+2u,oz,oy,ox);v.w=gB(base+3u,oz,oy,ox);} Bs[e]=v; }
+    workgroupBarrier();
+    for(var k4=0u;k4<4u;k4++){ var af:array<vec4<f16>,2>; var bf:array<vec4<f16>,8>;
+      for(var i=0u;i<2u;i++){af[i]=As[(ar+i)*4u+k4];} for(var j=0u;j<8u;j++){bf[j]=Bs[(br+j)*4u+k4];}
+      for(var i=0u;i<2u;i++){for(var j=0u;j<8u;j++){acc[i*8u+j]+=f32(dot(af[i],bf[j]));}} }
+    workgroupBarrier();
+  }
+  for(var i=0u;i<2u;i++){let gm=rowBase+ar+i; if(gm>=d.Co){continue;}
+    for(var j=0u;j<8u;j++){let gn=colBase+br+j; if(gn>=Nvox){continue;} outp[gm*Nvox+gn]=f16(acc[i*8u+j])+bias[gm];}}
+}`;
 const IN_STATS = `struct P{C:u32,N:u32}; @group(0)@binding(0) var<storage,read> x:array<f16>;
 @group(0)@binding(1) var<storage,read_write> st:array<f32>; @group(0)@binding(2) var<uniform> p:P;
 var<workgroup> ss:array<f32,256>; var<workgroup> sq:array<f32,256>;
@@ -117,5 +149,5 @@ export function makeRunner(dev) {
     const bg = dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })) });
     const cp = enc.beginComputePass(); cp.setPipeline(p); cp.setBindGroup(0, bg); cp.dispatchWorkgroups(wg[0], wg[1] || 1, wg[2] || 1); cp.end(); };
   const grid = n => { const nWG = Math.ceil(n / 256), gx = Math.min(65535, nWG); return { gx, wg: [gx, Math.ceil(nWG / gx), 1] }; };
-  return { pipe, uni, pass, grid, CONV, IN_STATS, IN_APPLY, IN_APPLY_LEAKY, ADD, LEAKY, POOL, RESIZE };
+  return { pipe, uni, pass, grid, CONV, CONV_VSM, IN_STATS, IN_APPLY, IN_APPLY_LEAKY, ADD, LEAKY, POOL, RESIZE };
 }
