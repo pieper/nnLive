@@ -140,6 +140,81 @@ fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:v
   let iz=(oz*d.ID)/d.OD; let iy=(oy*d.IH)/d.OH; let ix=(ox*d.IW)/d.OW;   // nearest/floor asymmetric
   y[idx]=x[((c*d.ID+iz)*d.IH+iy)*d.IW+ix]; }`;
 
+// Reusable graph net: load graph.json + weights.bin once, run per input (pooled buffers,
+// swappable graph inputs so a trunk's GPU outputs feed straight into perclick — no readback).
+export class Net {
+  constructor(dev, R) { this.dev = dev; this.R = R; this.ext = {}; this.inBuf = {}; }
+  async load(graphUrl, weightsUrl) {
+    const dev = this.dev;
+    this.graph = await (await fetch(graphUrl)).json();
+    const wblob = new Uint16Array(await (await fetch(weightsUrl)).arrayBuffer());
+    this.prod = s => s.reduce((a, b) => a * b, 1);
+    this.mk = b => dev.createBuffer({ size: Math.max(16, b), usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+    this.W = {}; for (const [n, w] of Object.entries(this.graph.weights)) { const b = this.mk(w.numel * 2); dev.queue.writeBuffer(b, 0, wblob.subarray(w.offset, w.offset + w.numel)); this.W[n] = b; }
+    this._plan();
+    return this;
+  }
+  bytesOf(n) { return this.prod(this.graph.tensors[n] || this.W[n].shape) * 2; }
+  _plan() {
+    const g = this.graph, R = this.R;
+    const inSet = new Set(g.inputs.map(i => i.name));
+    const cons = {}; for (const nd of g.nodes) for (const i of nd.in) (cons[i] = cons[i] || []).push(nd);
+    const skip = new Set(), fuseOut = {};
+    for (const nd of g.nodes) if (nd.op === 'InstanceNormalization') { const c = cons[nd.out[0]]; if (c && c.length === 1 && c[0].op === 'LeakyRelu') { skip.add(c[0]); fuseOut[nd.out[0]] = c[0].out[0]; } }
+    const ops = []; for (const nd of g.nodes) { if (skip.has(nd)) continue; const fo = nd.op === 'InstanceNormalization' ? fuseOut[nd.out[0]] : undefined; ops.push({ nd, out: fo || nd.out[0], fused: !!fo }); }
+    const lastUse = {}; ops.forEach((o, i) => { for (const t of o.nd.in) lastUse[t] = i; });
+    g.outputs.forEach(o => lastUse[o.name] = 1e18);
+    const T = {}, pool = []; this.zeroBias = {};
+    const acquire = b => { let bi = -1; for (let i = 0; i < pool.length; i++) if (pool[i].size >= b && (bi < 0 || pool[i].size < pool[bi].size)) bi = i; return bi >= 0 ? pool.splice(bi, 1)[0] : this.mk(b); };
+    const zB = C => (this.zeroBias[C] = this.zeroBias[C] || this.mk(C * 2));
+    this.recs = [];
+    ops.forEach((o, i) => {
+      const nd = o.nd, tsr = g.tensors;
+      if (!inSet.has(o.out)) T[o.out] = acquire(this.bytesOf(o.out));   // graph inputs are external (not pooled)
+      const r = { op: nd.op, ins: nd.in, out: o.out };
+      if (nd.op === 'Conv') { const os = tsr[o.out], is = tsr[nd.in[0]]; const Nvox = os[2] * os[3] * os[4], gx = Math.min(65535, Math.ceil(Nvox / 64));
+        r.bias = nd.bias ? nd.in[2] : null; r.Co = nd.Co; r.u = R.uni([nd.Ci, nd.Co, os[2], os[3], os[4], is[2], is[3], is[4], nd.K, nd.S, nd.pad, gx]); r.wg = [gx, Math.ceil(nd.Co / 64), Math.ceil(Nvox / 64 / gx)]; }
+      else if (nd.op === 'InstanceNormalization') { const s = tsr[o.out]; const C = s[1], N = s[2] * s[3] * s[4]; r.C = C; r.stats = this.mk(C * 2 * 4); r.u1 = R.uni([C, N]); const gd = R.grid(C * N); r.u2 = R.uni([C, N, gd.gx]); r.wg = gd.wg; r.applyK = o.fused ? R.IN_APPLY_LEAKY : R.IN_APPLY; }
+      else if (nd.op === 'LeakyRelu') { const n = this.prod(tsr[o.out]); const gd = R.grid(n); r.u = R.uni([n, gd.gx]); r.wg = gd.wg; }
+      else if (nd.op === 'Add') { const n = this.prod(tsr[o.out]); const gd = R.grid(n); r.u = R.uni([n, gd.gx]); r.wg = gd.wg; }
+      else if (nd.op === 'Concat') { r.parts = nd.in.map(x => this.bytesOf(x)); }
+      else if (nd.op === 'AveragePool' || nd.op === 'MaxPool') { const os = tsr[o.out], is = tsr[nd.in[0]]; const Nout = os[1] * os[2] * os[3] * os[4]; const gd = R.grid(Nout); r.u = R.uni([os[1], os[2], os[3], os[4], is[2], is[3], is[4], nd.kernel, nd.S, gd.gx]); r.wg = gd.wg; r.mx = nd.op === 'MaxPool'; }
+      else if (nd.op === 'Resize') { const os = tsr[o.out], is = tsr[nd.in[0]]; const Nout = os[1] * os[2] * os[3] * os[4]; const gd = R.grid(Nout); r.u = R.uni([os[1], os[2], os[3], os[4], is[2], is[3], is[4], gd.gx]); r.wg = gd.wg; }
+      // capture buffers NOW (pooling later nulls T[name]); graph inputs stay swappable via {inp} markers
+      r.inB = nd.in.map(n => inSet.has(n) ? { inp: n } : (this.W[n] || T[n]));
+      r.outB = T[o.out]; if (r.bias) r.biasB = this.W[r.bias];
+      this.recs.push(r);
+      for (const t of nd.in) if (lastUse[t] === i && !(t in this.W) && !inSet.has(t) && T[t]) { pool.push(T[t]); T[t] = null; }
+    });
+    this.T = T; this.zB = zB;
+  }
+  setInputBuffer(name, buf) { this.ext[name] = buf; }
+  setInputData(name, f32) { if (!this.inBuf[name]) this.inBuf[name] = this.mk(this.bytesOf(name)); this.dev.queue.writeBuffer(this.inBuf[name], 0, toF16(f32)); this.ext[name] = this.inBuf[name]; }
+  outBuf(name) { return this.ext[name] || this.T[name] || this.outBufFor(name); }
+  run() {
+    const B = x => x && x.inp ? this.ext[x.inp] : x, R = this.R, enc = this.dev.createCommandEncoder();
+    for (const r of this.recs) {
+      const i = r.inB, out = r.outB;
+      if (r.op === 'Conv') R.pass(enc, R.CONV, [B(i[0]), B(i[1]), r.bias ? r.biasB : this.zB(r.Co), out, r.u], r.wg);
+      else if (r.op === 'InstanceNormalization') { R.pass(enc, R.IN_STATS, [B(i[0]), r.stats, r.u1], [r.C, 1, 1]); R.pass(enc, r.applyK, [B(i[0]), r.stats, B(i[1]), B(i[2]), out, r.u2], r.wg); }
+      else if (r.op === 'LeakyRelu') R.pass(enc, R.LEAKY, [B(i[0]), out, r.u], r.wg);
+      else if (r.op === 'Add') R.pass(enc, R.ADD, [B(i[0]), B(i[1]), out, r.u], r.wg);
+      else if (r.op === 'Concat') { let off = 0; i.forEach((x, k) => { enc.copyBufferToBuffer(B(x), 0, out, off, r.parts[k]); off += r.parts[k]; }); }
+      else if (r.op === 'AveragePool' || r.op === 'MaxPool') R.pass(enc, R.POOL(r.mx), [B(i[0]), out, r.u], r.wg);
+      else if (r.op === 'Resize') R.pass(enc, R.RESIZE, [B(i[0]), out, r.u], r.wg);
+    }
+    this.dev.queue.submit([enc.finish()]);
+  }
+  outBufFor(name) { for (const r of this.recs) if (r.out === name) return r.outB; return this.ext[name]; }
+  async read(name, floatOut = true) {
+    const buf = this.outBufFor(name), n = this.prod(this.graph.tensors[name]);
+    const rb = this.dev.createBuffer({ size: n * 2, usage: U.MAP_READ | U.COPY_DST });
+    const e = this.dev.createCommandEncoder(); e.copyBufferToBuffer(buf, 0, rb, 0, n * 2); this.dev.queue.submit([e.finish()]);
+    await rb.mapAsync(GPUMapMode.READ); const u = new Uint16Array(rb.getMappedRange().slice(0)); rb.unmap();
+    return floatOut ? fromF16(u) : u;
+  }
+}
+
 export function makeRunner(dev) {
   const pc = new Map();
   const pipe = src => { if (pc.has(src)) return pc.get(src); const m = dev.createShaderModule({ code: 'enable f16;\n' + src });

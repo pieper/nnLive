@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>nnLive — Path A (nnInteractive-distilled) 64³ WASM demo</title>
+<title>nnLive — Path A (nnInteractive-distilled) custom-WGSL demo</title>
 <style>
   body{font:14px/1.5 system-ui,sans-serif;max-width:1080px;margin:1rem auto;padding:0 1rem;color:#111}
   h1{font-size:1.2rem;margin:.2rem 0}
@@ -12,12 +12,13 @@
   .pass{color:#0a7d28;font-weight:600}.fail{color:#c0242b;font-weight:600}.run{color:#b26a00}
   b#lat{font-size:1.1em}
 </style>
-<h1>nnLive — Path A (distilled nnInteractive) · 64³ · WASM</h1>
+<h1>nnLive — Path A (distilled nnInteractive) · custom WGSL · client-native</h1>
 <p id="sub">loading…</p>
 <p style="color:#555;margin:.2rem 0 .7rem">
   <b>Left-click</b> = positive · <b>Shift/right-click</b> = negative · scroll/slider = slice.
-  The <b>first click</b> defines a 64³ box and runs the cached image trunk once; every click then runs only the
-  per-click net (injectors + deep + slim decoder) and refines the mask. Click outside the box for a fresh region.
+  The <b>first click</b> defines a box (128³ = full nnInteractive FOV) and runs the cached image trunk once; every click then
+  runs only the per-click net (injectors + deep + slim decoder) and refines the mask. Click outside the box for a fresh region.
+  <b>?backend=wasm</b> to compare, <b>?p=64</b> for a faster/smaller box.
   Last decode: <b id="lat">—</b></p>
 <div class="row">
   <div>
@@ -37,7 +38,8 @@ const $=id=>document.getElementById(id);
 const logEl=$('log'), sub=$('sub'), lines=[];
 const log=s=>{lines.push(s);logEl.textContent=lines.join('\n');logEl.scrollTop=logEl.scrollHeight};
 const t0=performance.now(), clk=()=>((performance.now()-t0)/1000).toFixed(1)+'s';
-const P=+(new URLSearchParams(location.search).get('p')||64);   // patch: 64 (fast) or 128 (on-distribution)
+const P=+(new URLSearchParams(location.search).get('p')||128);   // patch: 64 (fast) or 128 (on-distribution, nnInteractive FOV)
+const BACKEND=new URLSearchParams(location.search).get('backend')||'custom-wgsl';   // custom-wgsl | wasm
 const ball=(r)=>{const o=[];for(let z=-r;z<=r;z++)for(let y=-r;y<=r;y++)for(let x=-r;x<=r;x++)if(x*x+y*y+z*z<=r*r)o.push([z,y,x]);return o;};
 const BALL3=ball(3);                               // matches training point radius
 
@@ -103,11 +105,11 @@ function paintMask(buf){
 
 function inCrop(z,y,x){ return crop && z>=crop.z0&&z<crop.z0+P && y>=crop.y0&&y<crop.y0+P && x>=crop.x0&&x<crop.x0+P; }
 
-const worker=new Worker('pathA-demo-worker.js?v=2',{type:'module'});
+const worker=new Worker(BACKEND==='wasm'?'pathA-demo-worker.js?v=2':'pathA-cw-worker.js?v=2',{type:'module'});
 worker.onmessage=(e)=>{
   const d=e.data;
   if(d.type==='ready'){ ready=true;
-    sub.innerHTML=`<span class="pass">ready</span> — WASM ${d.threads}t, load+warm ${(d.ms/1000).toFixed(1)}s. Click the CT.`;
+    sub.innerHTML=`<span class="pass">ready</span> — ${(d.backend||'wasm')} ${P}³${d.threads?(' '+d.threads+'t'):''}, load+warm ${(d.ms/1000).toFixed(1)}s. Click the CT.`;
     log(`[${clk()}] ready (wasm ${d.threads} threads, ${d.ms}ms load+warm)`);
     if(AUTO && lab){ const fg=[]; for(let z=0;z<Z;z++)for(let y=0;y<Y;y++)for(let x=0;x<X;x++) if(lab[(z*Y+y)*X+x]) fg.push([z,y,x]);
       let mz=0,my=0,mx=0; for(const[z,y,x]of fg){mz+=z;my+=y;mx+=x;} mz/=fg.length;my/=fg.length;mx/=fg.length;

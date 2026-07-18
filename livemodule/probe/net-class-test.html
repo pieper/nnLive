@@ -1,0 +1,21 @@
+<!doctype html><meta charset="utf-8"><title>Net class validation</title>
+<body style="font:13px ui-monospace,monospace;white-space:pre-wrap;padding:1rem" id="o">
+<script type="module">
+import { initDevice, makeRunner, Net } from './wgpu-net.js?v=9';
+const o=document.getElementById('o'); const log=s=>{o.textContent+=s+'\n';console.log(s);};
+const POST=x=>{try{fetch('/netclass_result',{method:'POST',body:JSON.stringify(x)});}catch(e){}};
+(async()=>{try{
+  const {dev}=await initDevice(); const R=makeRunner(dev);
+  const net=new Net(dev,R); await net.load('models/pathA/perclick_64.graph.json','models/pathA/perclick_64.weights.bin');
+  for(const nm of ['s0','s1','inter']){ const f=new Float32Array(await (await fetch('models/pathA/ref/'+nm+'.f32')).arrayBuffer()); net.setInputData(nm,f); }
+  net.run(); await dev.queue.onSubmittedWorkDone();
+  const got=await net.read('logits');
+  const ref=new Float32Array(await (await fetch('models/pathA/ref/logits_ref.f32')).arrayBuffer());
+  const N=got.length, N2=N/2; let md=0,ag=0; for(let i=0;i<N;i++){const d=Math.abs(got[i]-ref[i]);if(d>md)md=d;}
+  for(let i=0;i<N2;i++) if(Math.sign(got[N2+i]-got[i])===Math.sign(ref[N2+i]-ref[i])) ag++;
+  const sign=ag/N2;
+  log(`Net(perclick_64) vs ORT: max|diff| ${md.toFixed(3)} | sign-agree ${(sign*100).toFixed(2)}%`);
+  log(sign>0.99?'NET CLASS CORRECT ✓':'MISMATCH ✗');
+  POST({maxdiff:md,signAgree:sign,ok:sign>0.99});
+}catch(e){log('ERR '+(e.message||e));POST({error:String(e.message||e)});}})();
+</script>

@@ -92,6 +92,17 @@ if len(sys.argv) > 2 and sys.argv[2] == "fast":
         input_names=["s0", "s1", "inter"], output_names=["logits"], opset_version=17, do_constant_folding=True, dynamo=False)
     print(f"FAST: wrote perclick{TAG}.onnx"); sys.exit(0)
 
+# trunk8 mode: export trunk taking an 8-channel input directly (image in ch0, zeros ch1-7) -> s0,s1. Zero-trace.
+if len(sys.argv) > 2 and sys.argv[2] == "trunk8":
+    class Trunk8(nn.Module):
+        def __init__(s, p): super().__init__(); s.enc = p.enc
+        def forward(s, img8):
+            h = s.enc.stem(img8); a = s.enc.stages[0](h); b = s.enc.stages[1](a); return a, b
+    img8 = torch.zeros(1, 8, P, P, P)
+    torch.onnx.export(Trunk8(pathA).eval(), (img8,), join(OUT, f"trunk8{TAG}.onnx"),
+        input_names=["img8"], output_names=["s0", "s1"], opset_version=17, do_constant_folding=True, dynamo=False)
+    print(f"TRUNK8: wrote trunk8{TAG}.onnx"); sys.exit(0)
+
 # reference forward
 torch.manual_seed(0)
 img = torch.randn(1, 1, P, P, P); inter = (torch.rand(1, 7, P, P, P) > 0.98).float()
