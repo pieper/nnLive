@@ -20,56 +20,71 @@ try{
 
   // weight buffers
   const W={}; for(const [name,w] of Object.entries(graph.weights)){ const b=mkbuf(w.numel*2); dev.queue.writeBuffer(b,0,wblob.subarray(w.offset,w.offset+w.numel)); W[name]=b; }
-  // activation buffers (all tensors)
-  const T={}; for(const [name,shp] of Object.entries(graph.tensors)) T[name]=mkbuf(prod(shp)*2);
-  // inputs (from ORT ref; skipped in NOTEST timing mode -> zero inputs, data-independent timing)
-  if(!NOTEST) for(const inp of graph.inputs){ const f=new Float32Array(await (await fetch(`models/pathA/ref/${inp.name}.f32`)).arrayBuffer());
-    dev.queue.writeBuffer(T[inp.name],0,toF16(f)); }
   const zeroCache={}; const zeroBias=C=>{ if(!zeroCache[C]){ zeroCache[C]=mkbuf(C*2); } return zeroCache[C]; };
   const shpOf=n=> graph.tensors[n] || graph.weights[n]?.shape;
+  const bytesOf=n=> prod(shpOf(n))*2;
 
   // fusion: InstanceNorm whose SOLE consumer is a LeakyRelu -> apply leaky inside IN (skip the leaky node)
   const consumers={}; for(const nd of graph.nodes) for(const i of nd.in){ (consumers[i]=consumers[i]||[]).push(nd); }
   const skip=new Set(); const fuseOut={};
   for(const nd of graph.nodes){ if(nd.op==='InstanceNormalization'){ const c=consumers[nd.out[0]];
     if(c && c.length===1 && c[0].op==='LeakyRelu'){ skip.add(c[0]); fuseOut[nd.out[0]]=c[0].out[0]; } } }
-  let fused=0;
-  // build a static plan ONCE (pre-create all uniform + stats buffers), then re-record cheaply per run
+  // executed-ops list (fusion-aware): out = fused leaky's output when fused
+  const ops=[]; for(const nd of graph.nodes){ if(skip.has(nd)) continue;
+    const fo = nd.op==='InstanceNormalization' ? fuseOut[nd.out[0]] : undefined;
+    ops.push({nd, out: fo||nd.out[0], fused: !!fo}); }
+  const fused=ops.filter(o=>o.fused).length;
+  // liveness over executed ops
+  const lastUse={}; ops.forEach((o,i)=>{ for(const t of o.nd.in) lastUse[t]=i; });
+  graph.outputs.forEach(o=>lastUse[o.name]=1e18);
+
+  // buffer pool (liveness-based) — enables 192^3. inputs pre-uploaded, then pooled after last use.
+  const T={}; const pool=[]; let live=0, peak=0;
+  const acquire=(bytes)=>{ let bi=-1; for(let i=0;i<pool.length;i++){ if(pool[i].size>=bytes && (bi<0||pool[i].size<pool[bi].size)) bi=i; }
+    let b; if(bi>=0){ b=pool.splice(bi,1)[0]; } else { b=mkbuf(bytes); } live+=b.size; peak=Math.max(peak,live); return b; };
+  const release=(buf)=>{ pool.push(buf); live-=buf.size; };
+  for(const inp of graph.inputs){ const b=mkbuf(bytesOf(inp.name));
+    if(!NOTEST){ const f=new Float32Array(await (await fetch(`models/pathA/ref/${inp.name}.f32`)).arrayBuffer()); dev.queue.writeBuffer(b,0,toF16(f)); }
+    T[inp.name]=b; }
+
+  // build a static plan ONCE (uniforms + pooled buffer assignment), then re-record cheaply per run
   const plan=[];
-  for(const nd of graph.nodes){
-    if(skip.has(nd)) continue;
-    const inb=nd.in.map(n=> T[n]||W[n]), out=T[nd.out[0]];
+  ops.forEach((o,i)=>{
+    const nd=o.nd;
+    T[o.out]=acquire(bytesOf(o.out));                 // allocate output first (no same-node aliasing)
+    const inb=nd.in.map(n=> T[n]||W[n]), out=T[o.out];
     if(nd.op==='Conv'){
-      const os=graph.tensors[nd.out[0]], is=graph.tensors[nd.in[0]];
+      const os=graph.tensors[o.out], is=graph.tensors[nd.in[0]];
       const Co=nd.Co,Ci=nd.Ci,OD=os[2],OH=os[3],OW=os[4],ID=is[2],IH=is[3],IW=is[4];
       const Nvox=OD*OH*OW,nN=Math.ceil(Nvox/64),gx=Math.min(65535,nN);
       const bias=nd.bias?W[nd.in[2]]:zeroBias(Co); const u=R.uni([Ci,Co,OD,OH,OW,ID,IH,IW,nd.K,nd.S,nd.pad,gx]);
-      // Vsm helps isolated low-channel 3x3 convs but net-hurts the full pipeline (decoder is mostly 1x1) -> V4 for all.
       plan.push(e=>R.pass(e,R.CONV,[inb[0],inb[1],bias,out,u],[gx,Math.ceil(Co/64),Math.ceil(nN/gx)]));
     } else if(nd.op==='InstanceNormalization'){
-      const s=graph.tensors[nd.out[0]]; const C=s[1],N=s[2]*s[3]*s[4]; const stats=mkbuf(C*2*4);
+      const s=graph.tensors[o.out]; const C=s[1],N=s[2]*s[3]*s[4]; const stats=mkbuf(C*2*4);
       const u1=R.uni([C,N]); const {gx,wg}=R.grid(C*N); const u2=R.uni([C,N,gx]);
-      const fo=fuseOut[nd.out[0]]; const dst=fo?T[fo]:out; const applyK=fo?R.IN_APPLY_LEAKY:R.IN_APPLY; if(fo)fused++;
-      plan.push(e=>{R.pass(e,R.IN_STATS,[inb[0],stats,u1],[C,1,1]); R.pass(e,applyK,[inb[0],stats,inb[1],inb[2],dst,u2],wg);});
+      const applyK=o.fused?R.IN_APPLY_LEAKY:R.IN_APPLY;
+      plan.push(e=>{R.pass(e,R.IN_STATS,[inb[0],stats,u1],[C,1,1]); R.pass(e,applyK,[inb[0],stats,inb[1],inb[2],out,u2],wg);});
     } else if(nd.op==='LeakyRelu'){
-      const n=prod(graph.tensors[nd.out[0]]); const {gx,wg}=R.grid(n); const u=R.uni([n,gx]);
+      const n=prod(graph.tensors[o.out]); const {gx,wg}=R.grid(n); const u=R.uni([n,gx]);
       plan.push(e=>R.pass(e,R.LEAKY,[inb[0],out,u],wg));
     } else if(nd.op==='Add'){
-      const n=prod(graph.tensors[nd.out[0]]); const {gx,wg}=R.grid(n); const u=R.uni([n,gx]);
+      const n=prod(graph.tensors[o.out]); const {gx,wg}=R.grid(n); const u=R.uni([n,gx]);
       plan.push(e=>R.pass(e,R.ADD,[inb[0],inb[1],out,u],wg));
     } else if(nd.op==='Concat'){
-      const parts=nd.in.map(inp=>({buf:T[inp],bytes:prod(shpOf(inp))*2}));
+      const parts=nd.in.map(inp=>({buf:T[inp],bytes:bytesOf(inp)}));
       plan.push(e=>{let off=0; for(const p of parts){ e.copyBufferToBuffer(p.buf,0,out,off,p.bytes); off+=p.bytes; }});
     } else if(nd.op==='AveragePool'||nd.op==='MaxPool'){
-      const os=graph.tensors[nd.out[0]],is=graph.tensors[nd.in[0]]; const C=os[1],Nout=C*os[2]*os[3]*os[4];
+      const os=graph.tensors[o.out],is=graph.tensors[nd.in[0]]; const C=os[1],Nout=C*os[2]*os[3]*os[4];
       const {gx,wg}=R.grid(Nout); const u=R.uni([C,os[2],os[3],os[4],is[2],is[3],is[4],nd.kernel,nd.S,gx]); const mx=nd.op==='MaxPool';
       plan.push(e=>R.pass(e,R.POOL(mx),[inb[0],out,u],wg));
     } else if(nd.op==='Resize'){
-      const os=graph.tensors[nd.out[0]],is=graph.tensors[nd.in[0]]; const C=os[1],Nout=C*os[2]*os[3]*os[4];
+      const os=graph.tensors[o.out],is=graph.tensors[nd.in[0]]; const C=os[1],Nout=C*os[2]*os[3]*os[4];
       const {gx,wg}=R.grid(Nout); const u=R.uni([C,os[2],os[3],os[4],is[2],is[3],is[4],gx]);
       plan.push(e=>R.pass(e,R.RESIZE,[inb[0],out,u],wg));
     } else throw new Error('unhandled op '+nd.op);
-  }
+    for(const t of nd.in){ if(lastUse[t]===i && !(t in W) && T[t]) { release(T[t]); T[t]=null; } }  // free dead inputs
+  });
+  log(`plan: ${ops.length} ops, ${fused} IN+Leaky fused, peak pool ${(peak/1e6)|0} MB`);
   const runOnce=(enc)=>{ for(const p of plan) p(enc); };
 
   // run once (warm) + validate
