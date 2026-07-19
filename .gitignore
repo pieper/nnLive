@@ -1,41 +1,25 @@
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-*.egg-info/
-.ipynb_checkpoints/
-
-# Node / TypeScript
+# 188 MB model weights — distributed as a GitHub release asset, not committed
+docs/models/pathA/faithful/perclick_192.weights.bin
+livemodule/probe/models/**/perclick_*.weights.bin
+livemodule/probe/models/**/_*backup*/
+# node
 node_modules/
-dist/
-*.tsbuildinfo
-
-# Models & data (never commit weights or volumes — publish to the CORS bucket)
-*.onnx
-*.tflite
-*.pth
-*.ckpt
-*.nii
-*.nii.gz
-*.nrrd
-*.npy
-*.npz
-weights/
-cache/*.blosc
-training/cache/
-
-# OS / editor
-.DS_Store
-*.swp
-.idea/
-.vscode/
-
-# WGSL pipeline: large model/data binaries (regenerable; publish to CORS bucket)
-*.weights.bin
-*.bin
-*.f32
-*.wasm
-livemodule/probe/ort/
+idc_tools/node_modules/
+# scratch
+*.log
+docs/serve_docs.py
+docs/selftest_result.json
+docs/*_result.json
+docs/*_png.json
+# --- dev-only artifacts in livemodule/probe (never publish patient data or big blobs) ---
 livemodule/probe/real/
 livemodule/probe/models/
+livemodule/probe/chunks/
+livemodule/probe/chunks_128/
+livemodule/probe/chunks_student_128/
+livemodule/probe/ort/
+livemodule/probe/*.onnx
+livemodule/probe/*.png
+livemodule/probe/*_result.json
+livemodule/probe/prog_*.json
+livemodule/probe/faithful_*.json

@@ -1,0 +1,79 @@
+<!doctype html><meta charset=utf8><title>nan hunt</title>
+<body style="font:12px monospace;white-space:pre-wrap;padding:8px">loading…</body>
+<script type=module>
+import { initDevice, makeRunner, Net, fromF16 } from './wgpu-net.js?v=9';
+const out=document.body; const log=s=>{out.textContent+='\n'+s; console.log(s);};
+const P = +(new URLSearchParams(location.search).get('p')||192);
+const N = P*P*P;
+
+// NaN-checking readback of an arbitrary GPU buffer (f16), returns {nan, mn, mx}
+async function scan(dev, buf, nEl){
+  const rb = dev.createBuffer({size:nEl*2, usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST});
+  const e = dev.createCommandEncoder(); e.copyBufferToBuffer(buf,0,rb,0,nEl*2); dev.queue.submit([e.finish()]);
+  await rb.mapAsync(GPUMapMode.READ); const u=new Uint16Array(rb.getMappedRange().slice(0)); rb.unmap();
+  const f=fromF16(u); let nan=0,mn=1e30,mx=-1e30,inf=0;
+  for(let i=0;i<f.length;i++){const v=f[i]; if(Number.isNaN(v))nan++; else if(!Number.isFinite(v))inf++; else {if(v<mn)mn=v; if(v>mx)mx=v;}}
+  return {nan,inf,mn,mx};
+}
+
+// Instrumented run: submit one op at a time, scan its output buffer.
+async function debugRun(net, dev, label){
+  log(`\n=== ${label}: ${net.recs.length} ops ===`);
+  const B = x => x && x.inp ? net.ext[x.inp] : x;
+  const R = net.R; let firstNan=-1;
+  for(let k=0;k<net.recs.length;k++){
+    const r=net.recs[k]; const i=r.inB, out=r.outB; const enc=dev.createCommandEncoder();
+    if (r.op === 'Conv') R.pass(enc, R.CONV, [B(i[0]), B(i[1]), r.bias ? r.biasB : net.zB(r.Co), out, r.u], r.wg);
+    else if (r.op === 'InstanceNormalization') { R.pass(enc, R.IN_STATS, [B(i[0]), r.stats, r.u1], [r.C, 1, 1]); R.pass(enc, r.applyK, [B(i[0]), r.stats, B(i[1]), B(i[2]), out, r.u2], r.wg); }
+    else if (r.op === 'LeakyRelu') R.pass(enc, R.LEAKY, [B(i[0]), out, r.u], r.wg);
+    else if (r.op === 'Add') R.pass(enc, R.ADD, [B(i[0]), B(i[1]), out, r.u], r.wg);
+    else if (r.op === 'Concat') { let off=0; i.forEach((x,j)=>{enc.copyBufferToBuffer(B(x),0,out,off,r.parts[j]);off+=r.parts[j];}); }
+    else if (r.op === 'AveragePool' || r.op === 'MaxPool') R.pass(enc, R.POOL(r.mx), [B(i[0]), out, r.u], r.wg);
+    else if (r.op === 'Resize') R.pass(enc, R.RESIZE, [B(i[0]), out, r.u], r.wg);
+    dev.queue.submit([enc.finish()]); await dev.queue.onSubmittedWorkDone();
+    // scan output (cap elements scanned for speed on huge buffers)
+    const nEl = Math.min(net.prod(net.graph.tensors[r.out]||[1]), 60*1024*1024);
+    const s = await scan(dev, out, nEl);
+    if (s.nan>0 || s.inf>0){
+      log(`op#${k} ${r.op} -> ${r.out}  NaN=${s.nan} inf=${s.inf}  range[${s.mn.toFixed(3)},${s.mx.toFixed(3)}]  (first bad op!)`);
+      if(firstNan<0){ firstNan=k;
+        // dump input stats too
+        for(let a=0;a<i.length;a++){ const ib=B(i[a]); if(!ib){log(`   in[${a}]=null`);continue;}
+          const inName = r.ins[a]; const inEl = Math.min(net.prod(net.graph.tensors[inName]||net.graph.weights[inName]&&[net.graph.weights[inName].numel]||[1]), 40*1024*1024);
+          try{ const si=await scan(dev, ib, inEl); log(`   in[${a}] ${inName}: NaN=${si.nan} inf=${si.inf} range[${si.mn.toFixed(3)},${si.mx.toFixed(3)}]`);}catch(e){log(`   in[${a}] ${inName}: (scan failed ${e})`);}
+        }
+        log(`   uniform wg=${JSON.stringify(r.wg)}`);
+        break; // stop at first bad op
+      }
+    }
+  }
+  if(firstNan<0) log(`(no NaN/inf in any op output — clean)`);
+  return firstNan;
+}
+
+(async()=>{
+ try{
+  const {dev}=await initDevice(); const R=makeRunner(dev);
+  log(`device ok. P=${P} N=${N}`);
+  const trunk=new Net(dev,R); await trunk.load(`models/pathA/trunk8_${P}.graph.json`,`models/pathA/trunk8_${P}.weights.bin`);
+  const perclick=new Net(dev,R); await perclick.load(`models/pathA/perclick_${P}.graph.json`,`models/pathA/perclick_${P}.weights.bin`);
+  log('loaded nets');
+
+  // real-ish input: z-scored gaussian (Box-Muller), img8 = [img, zeros x7]
+  const img8=new Float32Array(8*N);
+  let seed=12345; const rnd=()=>{seed=(seed*1103515245+12345)&0x7fffffff; return seed/0x7fffffff;};
+  for(let i=0;i<N;i++){ const u1=Math.max(1e-7,rnd()),u2=rnd(); img8[i]=Math.sqrt(-2*Math.log(u1))*Math.cos(6.2831853*u2); }
+  trunk.setInputData('img8', img8);
+  const nf = await debugRun(trunk, dev, 'TRUNK8');
+  // read trunk outputs
+  for(const nm of ['s0','s1']){ const b=trunk.outBufFor(nm); const s=await scan(dev,b,Math.min(trunk.prod(trunk.graph.tensors[nm]),60*1024*1024)); log(`trunk out ${nm}: NaN=${s.nan} inf=${s.inf} range[${s.mn.toFixed(3)},${s.mx.toFixed(3)}]`);}
+
+  perclick.setInputBuffer('s0', trunk.outBuf('s0')); perclick.setInputBuffer('s1', trunk.outBuf('s1'));
+  const inter=new Float32Array(7*N); for(let i=0;i<N;i++) if(rnd()>0.98) inter[i]=1;
+  perclick.setInputData('inter', inter);
+  await debugRun(perclick, dev, 'PERCLICK');
+  log('\nDONE');
+  fetch('/nan_done',{method:'POST',body:out.textContent});
+ }catch(e){ log('ERR '+(e&&e.stack||e)); fetch('/nan_done',{method:'POST',body:out.textContent}); }
+})();
+</script>

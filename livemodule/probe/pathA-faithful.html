@@ -1,0 +1,197 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nnLive — Path A faithful (nnInteractive-style) custom-WGSL</title>
+<style>
+  body{font:14px/1.5 system-ui,sans-serif;max-width:1080px;margin:1rem auto;padding:0 1rem;color:#111}
+  h1{font-size:1.2rem;margin:.2rem 0}
+  #sub{color:#444;min-height:1.4em}
+  .row{display:flex;gap:1.4rem;align-items:flex-start;flex-wrap:wrap}
+  canvas{image-rendering:pixelated;border:1px solid #bbb;border-radius:4px;background:#000;cursor:crosshair}
+  #log{white-space:pre-wrap;background:#f6f6f6;padding:8px 10px;border-radius:6px;font-family:ui-monospace,monospace;font-size:11.5px;max-height:64vh;overflow:auto;flex:1;min-width:260px}
+  button{font:inherit;padding:.25rem .7rem;border-radius:5px;border:1px solid #bbb;background:#fff;cursor:pointer}
+  select{font:inherit;padding:.15rem .3rem}
+  .pass{color:#0a7d28;font-weight:600}.fail{color:#c0242b;font-weight:600}
+  .work{color:#e0561b;font-weight:600}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}} .work{animation:pulse 1s ease-in-out infinite}
+</style>
+<h1>nnLive — Path A · faithful nnInteractive refinement + auto-zoom · custom WGSL</h1>
+<p id="sub">loading…</p>
+<p style="color:#555;margin:.2rem 0 .7rem">
+  <b>point</b>: left-click = +, Shift/right-click = − · <b>bbox</b>/<b>scribble</b>: drag (Shift = −) · scroll/slider = slice · <b>new object</b> resets.
+  Each interaction <b>refines the current mask</b> (previous prediction fed back, decayed prompt memory) and
+  <b>auto-zooms ×1.5→×4</b> if the object exceeds the field of view — like nnInteractive.
+  (global z-score, EDT r4, decay 0.9, prev_seg autoregression)</p>
+<div class="row">
+  <div>
+    <canvas id="cv" width="480" height="480"></canvas>
+    <div style="margin-top:.4rem;display:flex;gap:.55rem;align-items:center;flex-wrap:wrap">
+      slice <input id="z" type="range" min="0" max="1" value="0" style="width:180px"> <span id="zv">0</span>
+      <select id="mode"><option value="point">point</option><option value="bbox">bbox</option><option value="scribble">scribble</option></select>
+      <button id="newobj">new object</button>
+      <label><input id="ov" type="checkbox" checked> mask</label>
+      <label><input id="rf" type="checkbox"> IDC seg</label>
+      <label><input id="bx" type="checkbox" checked> patch</label>
+    </div>
+  </div>
+  <div id="log"></div>
+</div>
+<script type="module">
+import { Interactions, extractCrop, globalStats, boxOrigin } from './faithful-enc.js?v=2';
+const $=id=>document.getElementById(id);
+const logEl=$('log'), sub=$('sub'), lines=[];
+const log=s=>{lines.push(s);logEl.textContent=lines.join('\n');logEl.scrollTop=logEl.scrollHeight;console.log(s)};
+const t0=performance.now(), clk=()=>((performance.now()-t0)/1000).toFixed(1)+'s';
+const AUTO=new URLSearchParams(location.search).has('auto');
+const GV=new URLSearchParams(location.search).get('gv')||'1';   // model graph version (bump when faithful graphs land)
+const P=192;                                                    // network patch size
+const MAX_ZOOM=4, BORDER_ABS=1200;                             // auto-zoom cap + border-touch threshold (voxels)
+
+let Z,Y,X, ct,vol,lab=null, mask, stats=null, inter=null;
+let center=null, curZoom=1;                     // current patch center (full-vol) + zoom
+let clicksAll=[];                              // display marks {z,y,x,sign}
+let ready=false, busy=false, pending=null, az=null;   // az: auto-zoom state machine
+let busyStage='', spinT0=0, animId=null, lastXY=null; // on-canvas activity indicator
+const cv=$('cv'), cx=cv.getContext('2d');
+const worker=new Worker('pathA-faithful-worker.js?v=3',{type:'module'});
+
+function ctrXY(ctr){ const sx=cv.width/X, sy=cv.height/Y; return {x:ctr[2]*sx+sx/2, y:ctr[1]*sy+sy/2}; }
+function setBusy(on, stage){ busyStage=stage||busyStage;
+  if(on){ if(stage) sub.innerHTML=`<span class="work">● ${stage}</span>`;
+    if(animId==null){ spinT0=performance.now(); loop(); } }
+  else { if(animId!=null){ cancelAnimationFrame(animId); animId=null; } draw(); }
+}
+function loop(){ draw(); spinner(); animId=requestAnimationFrame(loop); }
+function spinner(){
+  const p=lastXY||{x:cv.width-30,y:30}, R=15, t=(performance.now()-spinT0)/1000, a=t*4.2;
+  cx.save();
+  cx.strokeStyle='rgba(224,86,27,.28)'; cx.lineWidth=4; cx.beginPath(); cx.arc(p.x,p.y,R,0,2*Math.PI); cx.stroke();
+  cx.strokeStyle='#e0561b'; cx.lineWidth=4; cx.lineCap='round'; cx.beginPath(); cx.arc(p.x,p.y,R,a,a+2.0); cx.stroke();
+  const label=busyStage||'working…'; cx.font='600 11px system-ui'; cx.textAlign='center';
+  const w=cx.measureText(label).width+12, ly=p.y+R+13;
+  cx.fillStyle='rgba(20,20,20,.82)'; cx.beginPath(); cx.roundRect(p.x-w/2, ly-11, w, 16, 4); cx.fill();
+  cx.fillStyle='#ffd9c6'; cx.fillText(label, p.x, ly+1);
+  cx.restore();
+}
+
+function draw(){
+  const z=+$('z').value; $('zv').textContent=z;
+  const img=cx.createImageData(X,Y), o=z*Y*X;
+  const showMask=$('ov').checked, showRef=$('rf').checked&&lab;
+  for(let i=0;i<X*Y;i++){ const g=ct[o+i]; let r=g,gr=g,b=g;
+    if(showRef&&lab[o+i]){ gr=(gr+150)>>1; }
+    if(showMask&&mask[o+i]){ r=(r+255)>>1; gr=gr>>1; b=b>>1; }
+    const p=i*4; img.data[p]=r; img.data[p+1]=gr; img.data[p+2]=b; img.data[p+3]=255; }
+  const tmp=new OffscreenCanvas(X,Y); tmp.getContext('2d').putImageData(img,0,0);
+  cx.imageSmoothingEnabled=false; cx.clearRect(0,0,cv.width,cv.height); cx.drawImage(tmp,0,0,cv.width,cv.height);
+  const sx=cv.width/X, sy=cv.height/Y;
+  if($('bx').checked && center){ const size=Math.round(P*curZoom); const [oz,oy,ox]=boxOrigin(center,P,curZoom);
+    if(z>=oz && z<oz+size){ cx.strokeStyle='#e0561b88'; cx.lineWidth=1; cx.strokeRect(ox*sx, oy*sy, size*sx, size*sy); } }
+  if(drag){ cx.strokeStyle=drag.sign>0?'#00e0ff':'#ff3bd0'; cx.lineWidth=1.5;
+    if(drag.mode==='bbox') cx.strokeRect(Math.min(drag.x0,drag.x1)*sx,Math.min(drag.y0,drag.y1)*sy,Math.abs(drag.x1-drag.x0)*sx,Math.abs(drag.y1-drag.y0)*sy);
+    else { cx.beginPath(); drag.pts.forEach((p,i)=>{const X0=p[2]*sx+sx/2,Y0=p[1]*sy+sy/2; i?cx.lineTo(X0,Y0):cx.moveTo(X0,Y0);}); cx.stroke(); } }
+  for(const c of clicksAll){ if(c.z!==z) continue;
+    cx.strokeStyle=c.sign>0?'#00e0ff':'#ff3bd0'; cx.lineWidth=2;
+    const px=c.x*sx+sx/2, py=c.y*sy+sy/2;
+    cx.beginPath(); cx.moveTo(px-6,py); cx.lineTo(px+6,py); if(c.sign>0){cx.moveTo(px,py-6); cx.lineTo(px,py+6);} cx.stroke(); }
+}
+
+function borderCount(m){ // fg voxels on the 6 faces of the P^3 patch
+  let n=0; const F=P-1;
+  for(let a=0;a<P;a++)for(let b=0;b<P;b++){
+    if(m[(0*P+a)*P+b])n++; if(m[(F*P+a)*P+b])n++;
+    if(m[(a*P+0)*P+b])n++; if(m[(a*P+F)*P+b])n++;
+    if(m[(a*P+b)*P+0])n++; if(m[(a*P+b)*P+F])n++; }
+  return n;
+}
+function pasteMask(m, ctr, zoom){ const size=Math.round(P*zoom); const [oz,oy,ox]=boxOrigin(ctr,P,zoom);
+  for(let z=0;z<size;z++){ const zz=oz+z; if(zz<0||zz>=Z) continue; const pz=Math.min(P-1,Math.floor(z/zoom));
+    for(let y=0;y<size;y++){ const yy=oy+y; if(yy<0||yy>=Y) continue; const py=Math.min(P-1,Math.floor(y/zoom)); const vrow=(zz*Y+yy)*X, mrow=(pz*P+py)*P;
+      for(let x=0;x<size;x++){ const xx=ox+x; if(xx<0||xx>=X) continue; const px=Math.min(P-1,Math.floor(x/zoom)); mask[vrow+xx]=m[mrow+px]; } } }
+  inter.prev=mask;
+}
+function encodeAndInfer(ctr, zoom){ const crop=extractCrop(vol,Z,Y,X,ctr,P,zoom,stats.mean,stats.std);
+  worker.postMessage({type:'encode', image:crop.buffer, ctr, zoom},[crop.buffer]); }
+function runInfer(ctr, zoom){ const i7=inter.buildInter(ctr,P,zoom); worker.postMessage({type:'infer', inter:i7.buffer},[i7.buffer]); }
+
+function startPredict(ctr){ busy=true; center=ctr; curZoom=1; az={zoom:1}; lastXY=ctrXY(ctr); setBusy(true,'encoding…'); encodeAndInfer(ctr,1); }
+
+worker.onmessage=(e)=>{ const d=e.data;
+  if(d.type==='ready'){ ready=true;
+    sub.innerHTML=`<span class="pass">ready</span> — faithful 192³ (global-norm, EDT r4, decay 0.9, prev_seg, auto-zoom), warm ${(d.ms/1000).toFixed(1)}s. Click the CT.`;
+    if(AUTO) autoRun(); }
+  else if(d.type==='encoded'){ log(`[${clk()}] encode z${az.zoom} ${d.ms}ms`); setBusy(true,`segmenting${az.zoom>1?` · zoom ×${az.zoom}`:''}…`); runInfer(center, az.zoom); }
+  else if(d.type==='result'){ const m=new Uint8Array(d.mask); const bc=borderCount(m);
+    log(`[${clk()}] decode z${az.zoom} ${d.ms}ms · ${d.vox} vox · border ${bc}${d.nan?` · NaN ${d.nan}`:''}`);
+    if(az.zoom<MAX_ZOOM && bc>BORDER_ABS){ az.zoom=Math.min(MAX_ZOOM, az.zoom*1.5); curZoom=az.zoom; setBusy(true,`zoom ×${az.zoom} (object exceeds FOV)…`); encodeAndInfer(center, az.zoom); return; }
+    pasteMask(m, center, az.zoom); busy=false; setBusy(false);
+    sub.innerHTML=`<span class="pass">✓ ${d.vox.toLocaleString()} vox</span> · zoom ×${curZoom} · ${clicksAll.length} click${clicksAll.length>1?'s':''} — click to refine.`;
+    if(pending){ const ev=pending; pending=null; handle(ev); }
+    else if(AUTO) autoStep();
+  }
+  else if(d.type==='error'){ busy=false; setBusy(false); sub.innerHTML=`<span class="fail">✗ ${d.msg}</span>`; log('✗ '+d.msg); }
+};
+
+// ---------- pointer handling: point (click) / bbox (drag) / scribble (drag) ----------
+let drag=null;
+const toVox=ev=>{ const r=cv.getBoundingClientRect();
+  return { x:Math.max(0,Math.min(X-1,Math.floor((ev.clientX-r.left)/(cv.width/X)))),
+           y:Math.max(0,Math.min(Y-1,Math.floor((ev.clientY-r.top)/(cv.height/Y)))), z:+$('z').value }; }
+function handle(ev){ if(!ready){log('…not ready');return;} if(busy){pending=ev;return;} ev.preventDefault?.();
+  const mode=$('mode').value, sign=(ev.shiftKey||ev.button===2)?-1:1; const v=toVox(ev);
+  if(mode==='point'){ inter.addPoint(v.z,v.y,v.x,sign); clicksAll.push({z:v.z,y:v.y,x:v.x,sign}); startPredict([v.z,v.y,v.x]); }
+}
+cv.addEventListener('mousedown',ev=>{ if(!ready||busy)return; const mode=$('mode').value; const sign=(ev.shiftKey||ev.button===2)?-1:1; const v=toVox(ev);
+  if(mode==='point'){ handle(ev); return; }
+  ev.preventDefault(); drag={mode, sign, z:v.z, x0:v.x,y0:v.y, x1:v.x,y1:v.y, pts:[[v.z,v.y,v.x]]}; });
+cv.addEventListener('mousemove',ev=>{ if(!drag)return; const v=toVox(ev); drag.x1=v.x; drag.y1=v.y; if(drag.mode==='scribble') drag.pts.push([drag.z,v.y,v.x]); draw(); });
+window.addEventListener('mouseup',ev=>{ if(!drag)return; const d=drag; drag=null;
+  if(d.mode==='bbox'){ const z0=d.z, z1=d.z+1; inter.addBbox(z0,Math.min(d.y0,d.y1),Math.min(d.x0,d.x1),z1,Math.max(d.y0,d.y1)+1,Math.max(d.x0,d.x1)+1,d.sign);
+    startPredict([d.z, Math.round((d.y0+d.y1)/2), Math.round((d.x0+d.x1)/2)]); }
+  else { inter.addScribble(d.pts,d.sign); const my=d.pts.reduce((s,p)=>s+p[1],0)/d.pts.length, mx=d.pts.reduce((s,p)=>s+p[2],0)/d.pts.length; startPredict([d.z,Math.round(my),Math.round(mx)]); }
+  draw(); });
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+cv.addEventListener('wheel',e=>{e.preventDefault(); const z=Math.max(0,Math.min(Z-1,+$('z').value+(e.deltaY>0?1:-1))); $('z').value=z; draw();},{passive:false});
+
+function newObject(){ inter.clear(); clicksAll=[]; center=null; curZoom=1; mask.fill(0); draw(); }
+$('newobj').onclick=newObject;
+
+// ---- AUTO self-test: +click at fg centroid, then a corrective click; report vox+dice per round ----
+let autoRound=0;
+function diceVsIDC(){ if(!lab) return 0; let a=0,b=0,i=0; for(let k=0;k<mask.length;k++){ if(mask[k])a++; if(lab[k])b++; if(mask[k]&&lab[k])i++; } return (a+b)?2*i/(a+b):0; }
+function autoRun(){ if(!lab){ log('no IDC seg — auto skipped'); return; }
+  const fg=[]; for(let z=0;z<Z;z++)for(let y=0;y<Y;y++)for(let x=0;x<X;x++) if(lab[(z*Y+y)*X+x]) fg.push([z,y,x]);
+  let mz=0,my=0,mx=0; for(const[z,y,x]of fg){mz+=z;my+=y;mx+=x;} mz/=fg.length;my/=fg.length;mx/=fg.length;
+  let best=1e18,az0=0,ay=0,axx=0; for(const[z,y,x]of fg){const dd=(z-mz)**2+(y-my)**2+(x-mx)**2; if(dd<best){best=dd;az0=z;ay=y;axx=x;}}
+  window.__auto={rounds:[]}; autoRound=0; $('z').value=az0;
+  inter.addPoint(az0,ay,axx,1); clicksAll.push({z:az0,y:ay,x:axx,sign:1}); startPredict([az0,ay,axx]);
+}
+function autoStep(){ let a=0; for(let k=0;k<mask.length;k++) a+=mask[k]?1:0;
+  window.__auto.rounds.push({round:autoRound, vox:a, dice:+diceVsIDC().toFixed(4), zoom:curZoom});
+  autoRound++;
+  if(autoRound===1){ const c=largestErrorClick(); if(c){ $('z').value=c.z; inter.addPoint(c.z,c.y,c.x,c.sign); clicksAll.push(c); startPredict([c.z,c.y,c.x]); return; } }
+  try{ fetch('/faithful_result',{method:'POST',body:JSON.stringify(window.__auto)}); }catch(x){}
+  try{ fetch('/faithful_png',{method:'POST',body:cv.toDataURL('image/png')}); }catch(x){}
+  log('AUTO DONE '+JSON.stringify(window.__auto.rounds));
+}
+function largestErrorClick(){ let fn=0,fp=0; for(let k=0;k<mask.length;k++){ if(lab[k]&&!mask[k])fn++; else if(mask[k]&&!lab[k])fp++; }
+  const wantFN=fn>=fp; let sz=0,sy=0,sx=0,n=0;
+  for(let z=0;z<Z;z++)for(let y=0;y<Y;y++)for(let x=0;x<X;x++){ const k=(z*Y+y)*X+x; const e=wantFN?(lab[k]&&!mask[k]):(mask[k]&&!lab[k]); if(e){sz+=z;sy+=y;sx+=x;n++;} }
+  if(!n) return null; sz/=n;sy/=n;sx/=n; let bz=0,by=0,bx=0,bestd=-1,found=false;
+  for(let z=0;z<Z;z++)for(let y=0;y<Y;y++)for(let x=0;x<X;x++){ const k=(z*Y+y)*X+x; const e=wantFN?(lab[k]&&!mask[k]):(mask[k]&&!lab[k]); if(!e)continue; const dd=(z-sz)**2+(y-sy)**2+(x-sx)**2; if(bestd<0||dd<bestd){bestd=dd;bz=z;by=y;bx=x;found=true;} }
+  return found?{z:bz,y:by,x:bx,sign:wantFN?1:-1}:null;
+}
+
+(async ()=>{
+  const meta=await (await fetch('real/full_meta.json')).json(); [Z,Y,X]=meta.shape;
+  ct=new Uint8Array(await (await fetch('real/full_ct_u8.bin')).arrayBuffer());
+  vol=new Int16Array(await (await fetch('real/full_vol_i16.bin')).arrayBuffer());
+  try{ lab=new Uint8Array(await (await fetch('real/full_lab_u8.bin')).arrayBuffer()); }catch(e){}
+  mask=new Uint8Array(Z*Y*X); inter=new Interactions(Z,Y,X);
+  stats=globalStats(vol); log(`global z-score: mean ${stats.mean.toFixed(1)} std ${stats.std.toFixed(1)}`);
+  cv.width=Math.min(560,Math.round(X*2.2)); cv.height=Math.round(cv.width*Y/X);
+  $('z').max=Z-1; $('z').value=Math.floor(Z/2);
+  $('z').addEventListener('input',draw); for(const id of ['ov','rf','bx']) $(id).addEventListener('change',draw);
+  draw(); sub.textContent='loading custom-WGSL faithful pipeline (192³)…';
+  worker.postMessage({type:'init', res:P, v:GV});
+})();
+</script>

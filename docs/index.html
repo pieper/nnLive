@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nnLive — faithful nnInteractive in your browser (custom WebGPU)</title>
+<style>
+  :root{ color-scheme:dark; }
+  *{box-sizing:border-box}
+  body{font:14px/1.5 -apple-system,system-ui,sans-serif;margin:0;background:#0a0c12;color:#e7ecf5}
+  a{color:#8fd0ff}
+  header{padding:14px 18px;border-bottom:1px solid #1c2130;display:flex;gap:14px;align-items:baseline;flex-wrap:wrap}
+  header h1{font-size:1.15rem;margin:0;font-weight:700}
+  header .tag{color:#8aa0c0;font-size:.85rem}
+  #gpu{margin-left:auto;font-size:.82rem;color:#9fb3d0;text-align:right;min-width:220px}
+  #gpu b{color:#cfe0ff}
+  main{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap;padding:16px 18px}
+  canvas{image-rendering:pixelated;border:1px solid #232a3b;border-radius:6px;background:#000;cursor:crosshair;max-width:100%}
+  .panel{flex:1;min-width:280px}
+  .ctl{display:flex;gap:.55rem;align-items:center;flex-wrap:wrap;margin:.5rem 0}
+  button{font:inherit;padding:.35rem .8rem;border-radius:7px;border:1px solid #2c3448;background:#161c２b;color:#e7ecf5;cursor:pointer}
+  button.primary{border:0;color:#04121c;background:linear-gradient(180deg,#9fe9ff,#54c6f0);font-weight:700}
+  button:disabled{opacity:.5;cursor:default}
+  select,label{font:inherit}
+  #sub{color:#9fb3d0;min-height:1.4em}
+  #log{white-space:pre-wrap;background:#0e1220;border:1px solid #1c2130;padding:8px 10px;border-radius:6px;font-family:ui-monospace,monospace;font-size:11px;max-height:40vh;overflow:auto}
+  .pass{color:#57d98a;font-weight:600}.fail{color:#ff6b74;font-weight:600}.work{color:#ffb27a;font-weight:600}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}} .work{animation:pulse 1s ease-in-out infinite}
+  /* landing */
+  #land{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;background:rgba(6,8,14,.72);backdrop-filter:blur(6px)}
+  #land .card{max-width:min(620px,92vw);text-align:center;border-radius:20px;padding:30px 34px;background:linear-gradient(135deg,rgba(46,54,80,.5),rgba(16,20,34,.62));border:1px solid rgba(255,255,255,.15);box-shadow:0 18px 60px rgba(0,0,0,.55)}
+  #land h2{font-size:1.5rem;margin:.2rem 0 .1rem}
+  #land p{color:#b9c7de;margin:.5rem 0}
+  #land .stat{font-size:2rem;font-weight:800;color:#9fe9ff;line-height:1.1}
+  #bar{height:8px;border-radius:5px;background:#1a2233;overflow:hidden;margin:14px 0 6px;display:none}
+  #bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#54c6f0,#9fe9ff);transition:width .2s}
+  .lic{font-size:.72rem;color:#7f92ad;margin-top:14px}
+  .chip{display:inline-block;font-size:.72rem;color:#bcd;border:1px solid #2c3448;border-radius:6px;padding:1px 6px}
+</style>
+</head>
+<body>
+<header>
+  <h1>nnLive</h1>
+  <span class="tag">faithful nnInteractive · custom WebGPU · 192³ · runs entirely in your browser</span>
+  <div id="gpu">detecting GPU…</div>
+</header>
+
+<main>
+  <div>
+    <canvas id="cv" width="480" height="480"></canvas>
+    <div class="ctl">
+      slice <input id="z" type="range" min="0" max="1" value="0" style="width:170px"> <span id="zv">0</span>
+      <select id="mode" title="prompt type"><option value="point">point</option><option value="bbox">bbox</option><option value="scribble">scribble</option></select>
+      <button id="newobj">new object</button>
+      <button id="spin2">Spin another</button>
+      <label><input id="ov" type="checkbox" checked> mask</label>
+      <label><input id="rf" type="checkbox"> IDC seg</label>
+      <label><input id="bx" type="checkbox" checked> patch</label>
+    </div>
+    <p id="sub">initializing…</p>
+    <p style="color:#7f92ad;font-size:.82rem;margin:.2rem 0">
+      <b>point</b>: left-click = +, Shift/right-click = − · <b>bbox / scribble</b>: drag (Shift = −) · scroll = slice.
+      Each interaction <b>refines the running mask</b> (prev prediction fed back, decayed prompts) and <b>auto-zooms ×1.5→×4</b> — like nnInteractive.</p>
+  </div>
+  <div class="panel">
+    <div id="log"></div>
+  </div>
+</main>
+
+<!-- landing / spin -->
+<div id="land"><div class="card">
+  <h2>nnLive</h2>
+  <p>A faithful, browser-native port of <a href="https://github.com/MIC-DKFZ/nnInteractive" target="_blank" rel="noopener">nnInteractive</a> 3D promptable segmentation — distilled into a custom WebGPU runtime. Spin a random case from the NCI <a href="https://imaging.datacommons.cancer.gov/" target="_blank" rel="noopener">Imaging Data Commons</a>, then click to segment.</p>
+  <div id="landStat"></div>
+  <div id="bar"><i></i></div>
+  <p id="landMsg" style="min-height:1.3em"></p>
+  <div class="ctl" style="justify-content:center">
+    <button id="spin" class="primary">Spin a random IDC case</button>
+    <label><input id="ctonly" type="checkbox" checked> CT only</label>
+  </div>
+  <p class="lic">Code <span class="chip">Apache-2.0</span> · model weights inherit <span class="chip">CC BY-NC-SA 4.0</span> (nnInteractive-derived, non-commercial). Imaging streamed live from IDC public buckets under each collection's own license. Research/education only — not for clinical use.</p>
+</div></div>
+
+<script type="module">
+import { spinRandom, loadManifest, ohifViewerURL } from './idc_tools/index.js';
+import { Interactions, extractCrop, globalStats, boxOrigin } from './js/faithful-enc.js';
+
+const $=id=>document.getElementById(id);
+const logEl=$('log'), sub=$('sub'), lines=[];
+const log=s=>{lines.push(s);logEl.textContent=lines.join('\n');logEl.scrollTop=logEl.scrollHeight;};
+const t0=performance.now(), clk=()=>((performance.now()-t0)/1000).toFixed(1)+'s';
+const P=192, MAX_ZOOM=4, BORDER_ABS=1200;
+const GV=new URLSearchParams(location.search).get('gv')||'1';
+// perclick weights (188 MB): GitHub release asset on Pages, local copy on localhost (or ?weights=…)
+const REL_WEIGHTS='https://github.com/pieper/nnLive/releases/download/models-v1/perclick_192.weights.bin';
+const isLocal=/^(localhost|127\.|0\.0\.0\.0|\[::1\])/.test(location.hostname);
+const WEIGHTS_URL=new URLSearchParams(location.search).get('weights') || (isLocal?null:REL_WEIGHTS);
+const MODEL_BASE=new URL('models/pathA/faithful/', location.href).href;
+
+// ---------- state ----------
+let Z,Y,X, ct,vol,lab=null, mask, stats=null, inter=null;
+let center=null, curZoom=1, clicksAll=[];
+let modelReady=false, ctReady=false, busy=false, pending=null, az=null;
+let busyStage='', spinT0=0, animId=null, lastXY=null;
+const cv=$('cv'), cx=cv.getContext('2d');
+const worker=new Worker('js/pathA-faithful-worker.js?v=3',{type:'module'});
+
+// ---------- GPU info + expected performance ----------
+async function showGPU(){
+  if(!navigator.gpu){ $('gpu').innerHTML='<b class="fail">WebGPU not available</b> — try Chrome/Edge 113+ or Safari 18+'; return false; }
+  try{
+    const ad=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});
+    if(!ad){ $('gpu').innerHTML='<b class="fail">no WebGPU adapter</b>'; return false; }
+    let info=ad.info; if(!info && ad.requestAdapterInfo) info=await ad.requestAdapterInfo();
+    info=info||{};
+    const name=[info.description,info.vendor,info.architecture,info.device].filter(Boolean).join(' ').trim()||'GPU';
+    const f16=ad.features && ad.features.has && ad.features.has('shader-f16');
+    $('gpu').innerHTML=`GPU: <b>${name}</b>${f16?'':' <span class="fail">(no f16!)</span>'}<br><span id="perf">benchmarking…</span>`;
+    return true;
+  }catch(e){ $('gpu').innerHTML='<b class="fail">GPU probe failed</b>'; return false; }
+}
+
+function ratePerf(warmMs){
+  // warmMs = one full 192³ encode+decode from the worker warm-up ≈ first-click cost at zoom 1
+  const s=warmMs/1000;
+  const tier = s<1?'blazing':s<2.5?'fast':s<5?'good':s<10?'usable':'slow';
+  const el=$('perf'); if(el) el.innerHTML=`~<b>${s.toFixed(1)}s</b>/click (192³) · <b>${tier}</b>`;
+  return s;
+}
+
+// ---------- drawing ----------
+function draw(){
+  if(!ct) return;
+  const z=+$('z').value; $('zv').textContent=z;
+  const img=cx.createImageData(X,Y), o=z*Y*X;
+  const showMask=$('ov').checked, showRef=$('rf').checked&&lab;
+  for(let i=0;i<X*Y;i++){ const g=ct[o+i]; let r=g,gr=g,b=g;
+    if(showRef&&lab[o+i]){ gr=(gr+150)>>1; }
+    if(showMask&&mask[o+i]){ r=(r+255)>>1; gr=gr>>1; b=b>>1; }
+    const p=i*4; img.data[p]=r; img.data[p+1]=gr; img.data[p+2]=b; img.data[p+3]=255; }
+  const tmp=new OffscreenCanvas(X,Y); tmp.getContext('2d').putImageData(img,0,0);
+  cx.imageSmoothingEnabled=false; cx.clearRect(0,0,cv.width,cv.height); cx.drawImage(tmp,0,0,cv.width,cv.height);
+  const sx=cv.width/X, sy=cv.height/Y;
+  if($('bx').checked && center){ const size=Math.round(P*curZoom); const [oz,oy,ox]=boxOrigin(center,P,curZoom);
+    if(z>=oz && z<oz+size){ cx.strokeStyle='#e0561b88'; cx.lineWidth=1; cx.strokeRect(ox*sx, oy*sy, size*sx, size*sy); } }
+  if(drag){ cx.strokeStyle=drag.sign>0?'#00e0ff':'#ff3bd0'; cx.lineWidth=1.5;
+    if(drag.mode==='bbox') cx.strokeRect(Math.min(drag.x0,drag.x1)*sx,Math.min(drag.y0,drag.y1)*sy,Math.abs(drag.x1-drag.x0)*sx,Math.abs(drag.y1-drag.y0)*sy);
+    else { cx.beginPath(); drag.pts.forEach((p,i)=>{const X0=p[2]*sx+sx/2,Y0=p[1]*sy+sy/2; i?cx.lineTo(X0,Y0):cx.moveTo(X0,Y0);}); cx.stroke(); } }
+  for(const c of clicksAll){ if(c.z!==z) continue;
+    cx.strokeStyle=c.sign>0?'#00e0ff':'#ff3bd0'; cx.lineWidth=2;
+    const px=c.x*sx+sx/2, py=c.y*sy+sy/2;
+    cx.beginPath(); cx.moveTo(px-6,py); cx.lineTo(px+6,py); if(c.sign>0){cx.moveTo(px,py-6); cx.lineTo(px,py+6);} cx.stroke(); }
+}
+
+// ---------- activity indicator ----------
+function ctrXY(ctr){ const sx=cv.width/X, sy=cv.height/Y; return {x:ctr[2]*sx+sx/2, y:ctr[1]*sy+sy/2}; }
+function setBusy(on, stage){ busyStage=stage||busyStage;
+  if(on){ if(stage) sub.innerHTML=`<span class="work">● ${stage}</span>`; if(animId==null){ spinT0=performance.now(); anim(); } }
+  else { if(animId!=null){ cancelAnimationFrame(animId); animId=null; } draw(); } }
+function anim(){ draw(); spinner(); animId=requestAnimationFrame(anim); }
+function spinner(){
+  const p=lastXY||{x:cv.width-30,y:30}, R=15, t=(performance.now()-spinT0)/1000, a=t*4.2;
+  cx.save();
+  cx.strokeStyle='rgba(224,86,27,.28)'; cx.lineWidth=4; cx.beginPath(); cx.arc(p.x,p.y,R,0,2*Math.PI); cx.stroke();
+  cx.strokeStyle='#e0561b'; cx.lineWidth=4; cx.lineCap='round'; cx.beginPath(); cx.arc(p.x,p.y,R,a,a+2.0); cx.stroke();
+  const label=busyStage||'working…'; cx.font='600 11px system-ui'; cx.textAlign='center';
+  const w=cx.measureText(label).width+12, ly=p.y+R+13;
+  cx.fillStyle='rgba(10,12,18,.85)'; cx.beginPath(); cx.roundRect(p.x-w/2, ly-11, w, 16, 4); cx.fill();
+  cx.fillStyle='#ffd9c6'; cx.fillText(label, p.x, ly+1);
+  cx.restore();
+}
+
+// ---------- model plumbing ----------
+function borderCount(m){ let n=0; const F=P-1;
+  for(let a=0;a<P;a++)for(let b=0;b<P;b++){ if(m[(0*P+a)*P+b])n++; if(m[(F*P+a)*P+b])n++;
+    if(m[(a*P+0)*P+b])n++; if(m[(a*P+F)*P+b])n++; if(m[(a*P+b)*P+0])n++; if(m[(a*P+b)*P+F])n++; } return n; }
+function pasteMask(m, ctr, zoom){ const size=Math.round(P*zoom); const [oz,oy,ox]=boxOrigin(ctr,P,zoom);
+  for(let z=0;z<size;z++){ const zz=oz+z; if(zz<0||zz>=Z) continue; const pz=Math.min(P-1,Math.floor(z/zoom));
+    for(let y=0;y<size;y++){ const yy=oy+y; if(yy<0||yy>=Y) continue; const py=Math.min(P-1,Math.floor(y/zoom)); const vrow=(zz*Y+yy)*X, mrow=(pz*P+py)*P;
+      for(let x=0;x<size;x++){ const xx=ox+x; if(xx<0||xx>=X) continue; const px=Math.min(P-1,Math.floor(x/zoom)); mask[vrow+xx]=m[mrow+px]; } } }
+  inter.prev=mask; }
+function encodeAndInfer(ctr, zoom){ const crop=extractCrop(vol,Z,Y,X,ctr,P,zoom,stats.mean,stats.std);
+  worker.postMessage({type:'encode', image:crop.buffer, ctr, zoom},[crop.buffer]); }
+function runInfer(ctr, zoom){ const i7=inter.buildInter(ctr,P,zoom); worker.postMessage({type:'infer', inter:i7.buffer},[i7.buffer]); }
+function startPredict(ctr){ busy=true; center=ctr; curZoom=1; az={zoom:1}; lastXY=ctrXY(ctr); setBusy(true,'encoding…'); encodeAndInfer(ctr,1); }
+
+worker.onmessage=(e)=>{ const d=e.data;
+  if(d.type==='ready'){ modelReady=true; const s=ratePerf(d.ms); log(`[${clk()}] model ready — load ${((d.loadMs||d.ms)/1000).toFixed(1)}s · steady ${(d.ms/1000).toFixed(1)}s/click`);
+    $('landMsg').textContent = ctReady?'':'Model ready. '+($('landMsg').textContent||''); maybeEnable(); }
+  else if(d.type==='encoded'){ log(`[${clk()}] encode z${az.zoom} ${d.ms}ms`); setBusy(true,`segmenting${az.zoom>1?` · zoom ×${az.zoom}`:''}…`); runInfer(center, az.zoom); }
+  else if(d.type==='result'){ const m=new Uint8Array(d.mask); const bc=borderCount(m);
+    log(`[${clk()}] decode z${az.zoom} ${d.ms}ms · ${d.vox} vox · border ${bc}${d.nan?` · NaN ${d.nan}`:''}`);
+    if(az.zoom<MAX_ZOOM && bc>BORDER_ABS){ az.zoom=Math.min(MAX_ZOOM, az.zoom*1.5); curZoom=az.zoom; setBusy(true,`zoom ×${az.zoom} (exceeds FOV)…`); encodeAndInfer(center, az.zoom); return; }
+    pasteMask(m, center, az.zoom); busy=false; setBusy(false);
+    sub.innerHTML=`<span class="pass">✓ ${d.vox.toLocaleString()} vox</span> · zoom ×${curZoom} · ${clicksAll.length} click${clicksAll.length>1?'s':''} — click to refine.`;
+    if(pending){ const ev=pending; pending=null; handle(ev); } }
+  else if(d.type==='error'){ busy=false; setBusy(false); sub.innerHTML=`<span class="fail">✗ ${d.msg}</span>`; log('✗ '+d.msg); }
+};
+
+// ---------- pointer ----------
+let drag=null;
+const toVox=ev=>{ const r=cv.getBoundingClientRect();
+  return { x:Math.max(0,Math.min(X-1,Math.floor((ev.clientX-r.left)/(cv.width/X)))),
+           y:Math.max(0,Math.min(Y-1,Math.floor((ev.clientY-r.top)/(cv.height/Y)))), z:+$('z').value }; };
+function ready(){ return modelReady && ctReady; }
+function handle(ev){ if(!ready()){log('…not ready');return;} if(busy){pending=ev;return;} ev.preventDefault?.();
+  const mode=$('mode').value, sign=(ev.shiftKey||ev.button===2)?-1:1; const v=toVox(ev);
+  if(mode==='point'){ inter.addPoint(v.z,v.y,v.x,sign); clicksAll.push({z:v.z,y:v.y,x:v.x,sign}); startPredict([v.z,v.y,v.x]); } }
+cv.addEventListener('mousedown',ev=>{ if(!ready()||busy)return; const mode=$('mode').value; const sign=(ev.shiftKey||ev.button===2)?-1:1; const v=toVox(ev);
+  if(mode==='point'){ handle(ev); return; }
+  ev.preventDefault(); drag={mode, sign, z:v.z, x0:v.x,y0:v.y, x1:v.x,y1:v.y, pts:[[v.z,v.y,v.x]]}; });
+cv.addEventListener('mousemove',ev=>{ if(!drag)return; const v=toVox(ev); drag.x1=v.x; drag.y1=v.y; if(drag.mode==='scribble') drag.pts.push([drag.z,v.y,v.x]); draw(); });
+window.addEventListener('mouseup',ev=>{ if(!drag)return; const d=drag; drag=null;
+  if(d.mode==='bbox'){ inter.addBbox(d.z,Math.min(d.y0,d.y1),Math.min(d.x0,d.x1),d.z+1,Math.max(d.y0,d.y1)+1,Math.max(d.x0,d.x1)+1,d.sign);
+    startPredict([d.z, Math.round((d.y0+d.y1)/2), Math.round((d.x0+d.x1)/2)]); }
+  else { inter.addScribble(d.pts,d.sign); const my=d.pts.reduce((s,p)=>s+p[1],0)/d.pts.length, mx=d.pts.reduce((s,p)=>s+p[2],0)/d.pts.length; startPredict([d.z,Math.round(my),Math.round(mx)]); }
+  draw(); });
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+cv.addEventListener('wheel',e=>{e.preventDefault(); const z=Math.max(0,Math.min(Z-1,+$('z').value+(e.deltaY>0?1:-1))); $('z').value=z; draw();},{passive:false});
+function newObject(){ if(!inter)return; inter.clear(); clicksAll=[]; center=null; curZoom=1; mask.fill(0); draw(); }
+$('newobj').onclick=newObject;
+$('z').addEventListener('input',draw); for(const id of ['ov','rf','bx']) $(id).addEventListener('change',draw);
+
+function maybeEnable(){ if(ready()){ $('land').style.display='none'; sub.innerHTML='<span class="pass">ready</span> — click the image to segment.'; draw(); } }
+
+// ---------- IDC spin ----------
+function setBar(f){ const b=$('bar'); b.style.display='block'; b.querySelector('i').style.width=Math.round(f*100)+'%'; }
+async function onCT(c){
+  // idc_tools CTVolume: vol (Int16 HU), dims [nx,ny,nz], win/lev. Map to demo axes Z=nz,Y=ny,X=nx.
+  vol=c.vol; [X,Y,Z]=c.dims; Z=c.dims[2];
+  const lo=c.lev-c.win/2, sc=255/c.win;
+  ct=new Uint8Array(Z*Y*X); for(let i=0;i<ct.length;i++){ let g=(vol[i]-lo)*sc; ct[i]=g<0?0:g>255?255:g; }
+  mask=new Uint8Array(Z*Y*X); lab=null; inter=new Interactions(Z,Y,X);
+  stats=globalStats(vol); log(`[${clk()}] CT ${X}×${Y}×${Z} · z-score mean ${stats.mean.toFixed(1)} std ${stats.std.toFixed(1)}`);
+  cv.width=Math.min(560,Math.round(X*2.2)); cv.height=Math.round(cv.width*Y/X);
+  $('z').max=Z-1; $('z').value=Math.floor(Z/2);
+  ctReady=true; draw(); maybeEnable();
+}
+function onLabelmap(seg){ lab=seg.lab; log(`[${clk()}] IDC SEG: ${Object.values(seg.names).join(', ')}`); draw(); }
+
+let spinning=false;
+async function doSpin(){
+  if(spinning) return; spinning=true;
+  ctReady=false; newObject(); ct=null;
+  $('land').style.display='flex'; $('landMsg').textContent='listing series…'; setBar(0.02);
+  $('spin').disabled=true; $('spin2').disabled=true;
+  try{
+    const filter = $('ctonly').checked ? (e=>e.m==='CT') : undefined;
+    const { entry } = await spinRandom(
+      { onProgress:p=>{ setBar(p.frac); $('landMsg').textContent=p.msg; },
+        onCT, onLabelmap },
+      { manifestUrl:'segroulette.json', filter });
+    const oh=ohifViewerURL(entry.st);
+    $('landMsg').innerHTML = `<b>${entry.m}</b> · ${entry.col}${entry.sd?` · ${entry.sd}`:''}` + (oh?` · <a href="${oh}" target="_blank" rel="noopener">IDC viewer</a>`:'');
+    log(`[${clk()}] spun ${entry.m} ${entry.col} (${entry.c})`);
+  }catch(err){ $('landMsg').innerHTML=`<span class="fail">spin failed: ${err.message||err}</span> — try again`; log('✗ spin '+err); }
+  $('spin').disabled=false; $('spin2').disabled=false; spinning=false;
+}
+$('spin').onclick=()=>{ doSpin(); };
+$('spin2').onclick=()=>{ doSpin(); };
+
+// ---------- boot ----------
+(async ()=>{
+  const gpuOK=await showGPU();
+  // preload the model (188 MB) in parallel with the user reading the landing / spinning
+  worker.postMessage({type:'init', res:P, v:GV, base:MODEL_BASE, perclickWeights:WEIGHTS_URL||undefined});
+  sub.textContent='downloading model (~188 MB) + warming up…';
+  // show IDC stats on the landing
+  let manifestOK=false, mstats=null;
+  try{ const m=await loadManifest('segroulette.json'); const s=m.stats||{}; mstats=s; manifestOK=(m.rows&&m.rows.length>0);
+    $('landStat').innerHTML = s.sampled ? `<div class="stat">${s.sampled.toLocaleString()}</div><p>viewable IDC cases across ${s.collections} collections · ${(s.totalSeg||0).toLocaleString()} segmentation series (${s.idcVersion||''})</p>` : '';
+  }catch(e){}
+  // headless self-test (?selftest): report GPU + model-load + manifest without a live IDC spin
+  if(new URLSearchParams(location.search).has('selftest')){
+    const t=setInterval(()=>{ if(modelReady){ clearInterval(t);
+      const r={gpu:$('gpu').textContent.replace(/\s+/g,' ').trim(), gpuOK, modelReady, manifestOK, warmS:(performance.now()-t0)/1000|0};
+      fetch('/selftest_result',{method:'POST',body:JSON.stringify(r)}).catch(()=>{}); } }, 500);
+    setTimeout(()=>fetch('/selftest_result',{method:'POST',body:JSON.stringify({timeout:true, modelReady, manifestOK, gpuOK})}).catch(()=>{}), 180000);
+  }
+})();
+</script>
+</body>
+</html>

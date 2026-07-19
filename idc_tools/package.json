@@ -1,0 +1,21 @@
+{
+  "name": "idc_tools",
+  "version": "0.1.0",
+  "description": "Browser TypeScript utilities to stream and reconstruct imaging series straight from the NCI Imaging Data Commons (IDC) public buckets — including SEG Roulette (spin a random annotated series). No server, no install.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "Steve Pieper",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./worker": "./dist/idc-worker.js"
+  },
+  "files": ["dist", "src", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json",
+    "clean": "rm -rf dist"
+  },
+  "keywords": ["IDC", "imaging-data-commons", "DICOM", "SEG", "medical-imaging", "webgpu", "TCIA"],
+  "devDependencies": { "typescript": "^5.5.0" }
+}

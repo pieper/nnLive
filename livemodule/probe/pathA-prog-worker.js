@@ -37,8 +37,14 @@ self.onmessage = async (e) => {
       const t0 = performance.now();
       n.perclick.run(); const lg = await n.perclick.read('logits');
       const mask = new Uint8Array(n.N); let vox = 0;
-      for (let i = 0; i < n.N; i++) { const fg = lg[n.N + i] > lg[i] ? 1 : 0; mask[i] = fg; vox += fg; }
-      self.postMessage({ type: 'result', res: m.res, ms: Math.round(performance.now() - t0), vox, mask: mask.buffer }, [mask.buffer]);
+      // DIAG: logits stats (bg=ch0, fg=ch1)
+      let mn0=1e30,mx0=-1e30,mn1=1e30,mx1=-1e30,nan=0,s0=0,s1=0;
+      for (let i = 0; i < n.N; i++) { const a=lg[i], b=lg[n.N+i];
+        if(Number.isNaN(a)||Number.isNaN(b)) nan++;
+        if(a<mn0)mn0=a; if(a>mx0)mx0=a; if(b<mn1)mn1=b; if(b>mx1)mx1=b; s0+=a; s1+=b;
+        const fg = b > a ? 1 : 0; mask[i] = fg; vox += fg; }
+      const diag={nan, bg:[mn0,mx0,s0/n.N], fg:[mn1,mx1,s1/n.N]};
+      self.postMessage({ type: 'result', res: m.res, ms: Math.round(performance.now() - t0), vox, diag, mask: mask.buffer }, [mask.buffer]);
       return;
     }
   } catch (err) { self.postMessage({ type: 'error', msg: String((err && err.message) || err) }); }

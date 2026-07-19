@@ -16,8 +16,8 @@
 <p id="sub">loading…</p>
 <p style="color:#555;margin:.2rem 0 .7rem">
   <b>Left-click</b> = positive · <b>Shift/right-click</b> = negative · scroll/slider = slice.
-  Each click paints a <b>coarse 64³ result instantly</b>, then <b>refines at 128³</b> — a radial gauge at the click fills
-  as each tier lands. <b>192³ is a placeholder</b> until the multi-scale model finishes training. Tiers:
+  Each click paints a <b>coarse 64³ result instantly</b>, then <b>refines at 128³ and full-quality 192³</b> — a radial gauge
+  at the click fills as each tier lands (all three from the multi-scale model). Tiers:
   <span id="tiers"></span></p>
 <div class="row">
   <div>
@@ -38,16 +38,16 @@ const logEl=$('log'), sub=$('sub'), lines=[];
 const log=s=>{lines.push(s);logEl.textContent=lines.join('\n');logEl.scrollTop=logEl.scrollHeight;console.log(s)};
 const t0=performance.now(), clk=()=>((performance.now()-t0)/1000).toFixed(1)+'s';
 const AUTO=new URLSearchParams(location.search).has('auto');
-const RES=[64,128];                          // active tiers (both work today)
-const PLACEHOLDER=192;                        // shown but "coming"
+const RES=[64,128,192];                       // active tiers (multi-scale model — all three live)
+const PLACEHOLDER=null;                        // none — 192³ is real now
 const ALL=[64,128,192];
-const COLOR={64:'#3b9dff',128:'#0a7d28',192:'#9aa0a6'};
+const COLOR={64:'#3b9dff',128:'#0a7d28',192:'#e0561b'};
 const ball=(r)=>{const o=[];for(let z=-r;z<=r;z++)for(let y=-r;y<=r;y++)for(let x=-r;x<=r;x++)if(x*x+y*y+z*z<=r*r)o.push([z,y,x]);return o;};
 const BALL3=ball(3);
 
-let Z,Y,X, ct,vol,lab=null, mask;
+let Z,Y,X, ct,vol,lab=null, mask, volMin=0;
 let clicks=[], boxes={}, needEnc={}, ready=false, busy=false;
-let tier={64:'idle',128:'idle',192:'placeholder'};   // idle|computing|done|placeholder
+let tier={64:'idle',128:'idle',192:'idle'};   // idle|computing|done
 let lastXY=null, animating=false;
 const cv=$('cv'), cx=cv.getContext('2d');
 
@@ -84,17 +84,21 @@ function drawRadial(px,py){
     cx.beginPath(); cx.arc(px,py,rO,a0,a1); cx.arc(px,py,rI,a1,a0,true); cx.closePath();
     if(st==='done'){ cx.fillStyle=COLOR[P]+'dd'; cx.fill(); }
     else if(st==='computing'){ cx.fillStyle=COLOR[P]+(Math.floor((0.4+0.4*Math.abs(Math.sin(tnow*3)))*255)).toString(16).padStart(2,'0'); cx.fill(); }
-    else { cx.fillStyle='#00000022'; cx.fill(); cx.strokeStyle=(P===192?'#9aa0a6':'#ffffff66'); cx.lineWidth=1; if(P===192)cx.setLineDash([3,3]); cx.stroke(); cx.setLineDash([]); }
+    else { cx.fillStyle='#00000022'; cx.fill(); cx.strokeStyle='#ffffff66'; cx.lineWidth=1; cx.stroke(); }
   });
   cx.beginPath(); cx.arc(px,py,rI-2,0,2*Math.PI); cx.fillStyle='#000000aa'; cx.fill();
 }
 function loop(){ if(!animating) return; draw(); requestAnimationFrame(loop); }
 
 function extractCrop(P,z0,y0,x0){
+  // Boxes may extend past the volume (e.g. 192³ on a 177-slice CT). Pad OOB voxels with
+  // volMin (= vol.min(), matches trainer _crop) and z-score over the full padded patch.
   const out=new Float32Array(P*P*P); let sum=0,sum2=0;
   for(let z=0;z<P;z++)for(let y=0;y<P;y++)for(let x=0;x<P;x++){
-    const v=vol[(z0+z)*Y*X+(y0+y)*X+(x0+x)]; out[z*P*P+y*P+x]=v; sum+=v; sum2+=v*v; }
-  const n=P*P*P, mean=sum/n, std=Math.sqrt(Math.max(1e-8, sum2/n-mean*mean));
+    const zz=z0+z,yy=y0+y,xx=x0+x;
+    const v=(zz<0||zz>=Z||yy<0||yy>=Y||xx<0||xx>=X)?volMin:vol[(zz*Y+yy)*X+xx];
+    out[z*P*P+y*P+x]=v; sum+=v; sum2+=v*v; }
+  const n=P*P*P, mean=sum/n, std=Math.sqrt(Math.max(0, sum2/n-mean*mean))+1e-5;
   for(let i=0;i<out.length;i++) out[i]=(out[i]-mean)/std;
   return out;
 }
@@ -122,12 +126,13 @@ function processNext(){
 worker.onmessage=(e)=>{ const d=e.data;
   if(d.type==='loaded'){ log(`[${clk()}] ${d.res}³ pipeline loaded`); }
   else if(d.type==='ready'){ ready=true; tierBadges();
-    sub.innerHTML=`<span class="pass">ready</span> — custom-WGSL 64³+128³ (192³ soon), load+warm ${(d.ms/1000).toFixed(1)}s. Click the CT.`;
+    sub.innerHTML=`<span class="pass">ready</span> — custom-WGSL 64³+128³+192³ (multi-scale), load+warm ${(d.ms/1000).toFixed(1)}s. Click the CT.`;
     if(AUTO) autoClick(); }
   else if(d.type==='encoded'){ log(`[${clk()}] ${d.res}³ trunk encode ${d.ms}ms`);
     const inter=buildInter(d.res); worker.postMessage({type:'infer', res:d.res, inter:inter.buffer}, [inter.buffer]); }
   else if(d.type==='result'){ needEnc[d.res]=false; paintMask(d.res, d.mask); tier[d.res]='done'; tierBadges();
     log(`[${clk()}] ${d.res}³ decode ${d.ms}ms · ${d.vox} vox`); if(d.res===128)window.__vox128=d.vox;
+    (window.__diag=window.__diag||{})[d.res]={vox:d.vox, ...d.diag};
     draw(); seqIdx++; processNext(); }
   else if(d.type==='error'){ sub.innerHTML=`<span class="fail">✗ ${d.msg}</span>`; log('✗ '+d.msg); busy=false; animating=false; }
 };
@@ -139,12 +144,16 @@ function onClick(ev){
   const rect=cv.getBoundingClientRect();
   const x=Math.floor((ev.clientX-rect.left)/(cv.width/X)), y=Math.floor((ev.clientY-rect.top)/(cv.height/Y)), z=+$('z').value;
   const sign=(ev.shiftKey||ev.button===2)?-1:1;
-  const fresh = RES.some(P=>!boxes[P]||!inBox(P,z,y,x));
+  // Only start over when the click leaves the LARGEST box's field of view; otherwise
+  // accumulate points (they feed every tier that can see them). Prevents the old bug where
+  // a click just outside the tiny 64³ box wiped all prior clicks.
+  const Pmax=Math.max(...ALL);
+  const fresh = !boxes[Pmax] || !inBox(Pmax,z,y,x);
   if(fresh){ mask.fill(0); clicks=[{z,y,x,sign}];
     for(const P of ALL){ const z0=Math.max(0,Math.min(z-(P>>1),Z-P)),y0=Math.max(0,Math.min(y-(P>>1),Y-P)),x0=Math.max(0,Math.min(x-(P>>1),X-P));
       boxes[P]={z0,y0,x0}; } for(const P of RES) needEnc[P]=true; }
   else clicks.push({z,y,x,sign});
-  for(const P of RES) tier[P]='idle'; tier[192]='placeholder';
+  for(const P of RES) tier[P]='idle';
   lastXY={x:x*(cv.width/X)+(cv.width/X)/2, y:y*(cv.height/Y)+(cv.height/Y)/2};
   busy=true; animating=true; seqIdx=0; loop(); tierBadges(); processNext();
 }
@@ -158,12 +167,13 @@ function autoClick(){ if(!lab) return; const fg=[]; for(let z=0;z<Z;z++)for(let 
 function postAuto(){ let a=0,b=0,inter=0; for(let i=0;i<mask.length;i++){ if(lab){ if(mask[i]&&lab[i])inter++; a+=mask[i]?1:0; b+=lab[i]?1:0; } }
   const dice=(a+b)?2*inter/(a+b):0;
   try{ fetch('/prog_png',{method:'POST',body:cv.toDataURL('image/png')}); }catch(x){}
-  try{ fetch('/prog_result',{method:'POST',body:JSON.stringify({vox128:window.__vox128,maskVox:a,diceVsIDC:dice})}); }catch(x){} }
+  try{ fetch('/prog_result',{method:'POST',body:JSON.stringify({vox128:window.__vox128,maskVox:a,diceVsIDC:dice,diag:window.__diag})}); }catch(x){} }
 
 (async ()=>{
   const meta=await (await fetch('real/full_meta.json')).json(); [Z,Y,X]=meta.shape;
   ct=new Uint8Array(await (await fetch('real/full_ct_u8.bin')).arrayBuffer());
   vol=new Int16Array(await (await fetch('real/full_vol_i16.bin')).arrayBuffer());
+  volMin=vol[0]; for(let i=1;i<vol.length;i++) if(vol[i]<volMin) volMin=vol[i];
   try{ lab=new Uint8Array(await (await fetch('real/full_lab_u8.bin')).arrayBuffer()); }catch(e){}
   mask=new Uint8Array(Z*Y*X);
   cv.width=Math.min(560,Math.round(X*2.2)); cv.height=Math.round(cv.width*Y/X);
@@ -171,9 +181,9 @@ function postAuto(){ let a=0,b=0,inter=0; for(let i=0;i<mask.length;i++){ if(lab
   $('z').addEventListener('input',draw); for(const id of ['ov','rf','bx']) $(id).addEventListener('change',draw);
   cv.addEventListener('mousedown',onClick); cv.addEventListener('contextmenu',e=>e.preventDefault());
   cv.addEventListener('wheel',e=>{e.preventDefault(); const z=Math.max(0,Math.min(Z-1,+$('z').value+(e.deltaY>0?1:-1))); $('z').value=z; draw();},{passive:false});
-  $('clear').onclick=()=>{ boxes={}; clicks=[]; mask.fill(0); for(const P of RES)tier[P]='idle'; tier[192]='placeholder'; animating=false; tierBadges(); draw(); };
+  $('clear').onclick=()=>{ boxes={}; clicks=[]; mask.fill(0); for(const P of RES)tier[P]='idle'; animating=false; tierBadges(); draw(); };
   tierBadges(); draw();
-  sub.textContent='loading custom-WGSL pipelines (64³ + 128³)…';
+  sub.textContent='loading custom-WGSL pipelines (64³ + 128³ + 192³)…';
   worker.postMessage({type:'init', res:RES});
   log(`[${clk()}] volume ${Z}×${Y}×${X} loaded; loading 64³+128³ pipelines…`);
 })();
