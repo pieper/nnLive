@@ -87,7 +87,7 @@ import { Interactions, extractCrop, globalStats, boxOrigin } from './js/faithful
 
 const $=id=>document.getElementById(id);
 const logEl=$('log'), sub=$('sub'), lines=[];
-const log=s=>{lines.push(s);logEl.textContent=lines.join('\n');logEl.scrollTop=logEl.scrollHeight;};
+const log=s=>{lines.push(s);logEl.textContent=lines.join('\n');logEl.scrollTop=logEl.scrollHeight;console.log('[nnLive] '+s);};
 const t0=performance.now(), clk=()=>((performance.now()-t0)/1000).toFixed(1)+'s';
 const P=192, MAX_ZOOM=4, BORDER_ABS=1200;
 const GV=new URLSearchParams(location.search).get('gv')||'1';
