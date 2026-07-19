@@ -91,11 +91,10 @@ const log=s=>{lines.push(s);logEl.textContent=lines.join('\n');logEl.scrollTop=l
 const t0=performance.now(), clk=()=>((performance.now()-t0)/1000).toFixed(1)+'s';
 const P=192, MAX_ZOOM=4, BORDER_ABS=1200;
 const GV=new URLSearchParams(location.search).get('gv')||'1';
-// perclick weights (188 MB): GitHub release asset on Pages, local copy on localhost (or ?weights=…)
-const REL_WEIGHTS='https://github.com/pieper/nnLive/releases/download/models-v1/perclick_192.weights.bin';
-const isLocal=/^(localhost|127\.|0\.0\.0\.0|\[::1\])/.test(location.hostname);
-const WEIGHTS_URL=new URLSearchParams(location.search).get('weights') || (isLocal?null:REL_WEIGHTS);
 const MODEL_BASE=new URL('models/pathA/faithful/', location.href).href;
+// 188 MB perclick weights live in a CORS-enabled JS2 (Jetstream2) Ceph bucket — not in the repo, and not a
+// GitHub release asset (those aren't CORS-fetchable cross-origin). ?weights= overrides for local testing.
+const WEIGHTS_URL=new URLSearchParams(location.search).get('weights') || 'https://js2.jetstream-cloud.org:8001/swift/v1/nnlive-models/perclick_192.weights.bin';
 
 // ---------- state ----------
 let Z,Y,X, ct,vol,lab=null, mask, stats=null, inter=null;

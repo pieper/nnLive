@@ -8,15 +8,17 @@ The nnLive student model is **distilled from the [nnInteractive](https://github.
 
 This applies **only to the model weights**. The nnLive source code in this repository is separately licensed under **Apache-2.0** (see [`LICENSE`](LICENSE)).
 
-## Weight artifacts (GitHub release assets)
+## Weight artifacts (hosting)
 
-The large weight files are distributed as **GitHub release assets**, not committed to the repository:
+The large weight file is **not committed to the repository**. It is served from a public, **CORS-enabled** JS2 (Jetstream2 / NSF ACCESS) Ceph object bucket so the browser demo can fetch it cross-origin:
 
-| File | Contents |
+| File | URL |
 |---|---|
-| `perclick_192.weights.bin` | fp16 weights for the prompt-conditioned decode network (192³) |
+| `perclick_192.weights.bin` (fp16 decode net, 188 MB) | `https://js2.jetstream-cloud.org:8001/swift/v1/nnlive-models/perclick_192.weights.bin` |
 
-The small graph descriptors and the image-trunk weights (`docs/models/pathA/faithful/trunk8_192.*`, `perclick_192.graph.json`) are in the repository. The live demo fetches `perclick_192.weights.bin` from the latest release; for local development it uses a local copy (`?weights=` overrides the URL).
+The small graph descriptors and the image-trunk weights (`docs/models/pathA/faithful/trunk8_192.*`, `perclick_192.graph.json`) are in the repository. The demo fetches the decode weights from the bucket URL above; `?weights=<url>` overrides it for local development.
+
+> Note: GitHub **release assets are not usable** here — `release-assets.githubusercontent.com` does not send `Access-Control-Allow-Origin`, so a cross-origin browser `fetch()` of a release asset is blocked. The CORS-enabled bucket avoids both that and the 100 MB per-file repo limit.
 
 ## Provenance
 

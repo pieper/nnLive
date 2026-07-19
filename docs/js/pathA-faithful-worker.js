@@ -3,6 +3,16 @@
 import { initDevice, makeRunner, Net } from './wgpu-net.js?v=9';
 let dev, R, net = null, N = 0, P = 0;
 
+// Weights may be a single .bin (local) or a chunk manifest .json (Pages serves <50MB parts same-origin,
+// since GitHub blocks >100MB files and release assets aren't CORS-fetchable). Reassemble to a blob URL.
+async function resolveWeights(url) {
+  if (!/\.json(\?|$)/.test(url)) return url;
+  const clean = url.split('?')[0], dir = clean.slice(0, clean.lastIndexOf('/') + 1);
+  const man = await (await fetch(url)).json();
+  const bufs = await Promise.all(man.parts.map((p) => fetch(dir + p).then((r) => r.arrayBuffer())));
+  return URL.createObjectURL(new Blob(bufs, { type: 'application/octet-stream' }));
+}
+
 self.onmessage = async (e) => {
   const m = e.data;
   try {
@@ -14,7 +24,8 @@ self.onmessage = async (e) => {
       const qv = `?v=${m.v||1}`;
       ({ dev } = await initDevice()); R = makeRunner(dev);
       const trunk = new Net(dev, R); await trunk.load(`${base}trunk8_${P}.graph.json${qv}`, `${base}trunk8_${P}.weights.bin${qv}`);
-      const perclick = new Net(dev, R); await perclick.load(`${base}perclick_${P}.graph.json${qv}`, pcW.includes('?') ? pcW : pcW + qv);
+      const pcUrl = await resolveWeights(pcW);   // .json manifest -> reassembled blob URL; .bin -> passthrough
+      const perclick = new Net(dev, R); await perclick.load(`${base}perclick_${P}.graph.json${qv}`, pcUrl.startsWith('blob:') ? pcUrl : (pcUrl.includes('?') ? pcUrl : pcUrl + qv));
       trunk.setInputData('img8', new Float32Array(8*N));
       perclick.setInputData('inter', new Float32Array(7*N));
       // warm pass 1 = compiles shaders (slow, one-time); pass 2 = steady-state per-click cost estimate

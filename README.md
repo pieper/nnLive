@@ -57,7 +57,7 @@ nnLive is also a component of **SlicerLive**: the `livemodule/` half is a place-
 ## Licensing
 
 - **Code** (this repository, including `idc_tools` and the WebGPU runtime): **Apache License 2.0** — see [`LICENSE`](LICENSE).
-- **Model weights** (distributed as GitHub release assets): the student is derived from nnInteractive and therefore **inherits nnInteractive's [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) terms — non-commercial, share-alike, with attribution.** See [`MODELS.md`](MODELS.md).
+- **Model weights** (served from a CORS-enabled JS2 object bucket, not committed to the repo): the student is derived from nnInteractive and therefore **inherits nnInteractive's [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) terms — non-commercial, share-alike, with attribution.** See [`MODELS.md`](MODELS.md).
 - **Imaging data** is streamed live from the IDC public buckets at runtime and is **not redistributed by this repository**; each IDC collection carries its own license (shown in the viewer).
 
 ## ⚠️ Not for clinical use
