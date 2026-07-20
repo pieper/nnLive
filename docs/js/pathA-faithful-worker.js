@@ -63,7 +63,7 @@ self.onmessage = async (e) => {
         const tw = performance.now();
         trunk.run(); await dev.queue.onSubmittedWorkDone();
         perclick.setInputBuffer('s0', trunk.outBuf('s0')); perclick.setInputBuffer('s1', trunk.outBuf('s1'));
-        perclick.run(); await perclick.read('logits');
+        perclick.run(); await perclick.argmaxMask('logits');
         steadyMs = Math.round(performance.now() - tw);
       }
       net = { trunk, perclick };
@@ -81,12 +81,10 @@ self.onmessage = async (e) => {
     if (m.type === 'infer') {                      // {inter: Float32Array(7*P^3)}
       net.perclick.setInputData('inter', new Float32Array(m.inter));
       const t0 = performance.now();
-      net.perclick.run(); const lg = await net.perclick.read('logits');
-      const mask = new Uint8Array(N); let vox = 0, nan = 0;
-      for (let i = 0; i < N; i++) { const a=lg[i], b=lg[N+i];
-        if (Number.isNaN(a)||Number.isNaN(b)) nan++;
-        const fg = b > a ? 1 : 0; mask[i] = fg; vox += fg; }
-      self.postMessage({ type: 'result', ms: Math.round(performance.now() - t0), vox, nan, mask: mask.buffer }, [mask.buffer]);
+      net.perclick.run();
+      const mask = await net.perclick.argmaxMask('logits');   // GPU argmax → u8 mask (no 28MB readback + fromF16)
+      let vox = 0; for (let i = 0; i < N; i++) vox += mask[i];
+      self.postMessage({ type: 'result', ms: Math.round(performance.now() - t0), vox, mask: mask.buffer }, [mask.buffer]);
       return;
     }
   } catch (err) { self.postMessage({ type: 'error', msg: String((err && err.message) || err) }); }

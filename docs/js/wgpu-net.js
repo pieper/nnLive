@@ -213,7 +213,32 @@ export class Net {
     await rb.mapAsync(GPUMapMode.READ); const u = new Uint16Array(rb.getMappedRange().slice(0)); rb.unmap();
     return floatOut ? fromF16(u) : u;
   }
+  // GPU argmax of a 2-channel logits tensor -> 1-byte-per-voxel mask (fg = ch1 > ch0), packed 4/u32.
+  // Reads back N bytes instead of 2N f16 + a JS fromF16 on 2N values (the big per-click CPU cost).
+  async argmaxMask(name) {
+    const buf = this.outBufFor(name), N = this.prod(this.graph.tensors[name]) / 2, n4 = Math.ceil(N / 4);
+    if (!this._maskBuf || this._maskN !== N) {
+      this._maskBuf = this.mk(n4 * 4); this._maskN = N;
+      const gd = this.R.grid(n4); this._maskU = this.R.uni([N, gd.gx]); this._maskWg = gd.wg;
+    }
+    const enc = this.dev.createCommandEncoder();
+    this.R.pass(enc, this.R.ARGMAX, [buf, this._maskBuf, this._maskU], this._maskWg);
+    const rb = this.dev.createBuffer({ size: n4 * 4, usage: U.MAP_READ | U.COPY_DST });
+    enc.copyBufferToBuffer(this._maskBuf, 0, rb, 0, n4 * 4); this.dev.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ); const u = new Uint8Array(rb.getMappedRange().slice(0, N)); rb.unmap();
+    return u;
+  }
 }
+// argmax(ch1>ch0) over a 2-ch logits buffer -> u8 mask packed 4-per-u32 (avoids fromF16 + JS argmax loop)
+const ARGMAX = `struct P{N:u32,gx:u32}; @group(0)@binding(0) var<storage,read> lg:array<f16>;
+@group(0)@binding(1) var<storage,read_write> outp:array<u32>; @group(0)@binding(2) var<uniform> p:P;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let q=(wid.y*p.gx+wid.x)*256u+lid.x; let base=q*4u; if(base>=p.N){return;}
+  var packed:u32=0u;
+  for(var j=0u;j<4u;j++){ let i=base+j; if(i<p.N){
+    let fg=select(0u,1u, f32(lg[p.N+i])>f32(lg[i])); packed=packed|(fg<<(j*8u)); } }
+  outp[q]=packed; }`;
 
 export function makeRunner(dev) {
   const pc = new Map();
@@ -224,5 +249,5 @@ export function makeRunner(dev) {
     const bg = dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })) });
     const cp = enc.beginComputePass(); cp.setPipeline(p); cp.setBindGroup(0, bg); cp.dispatchWorkgroups(wg[0], wg[1] || 1, wg[2] || 1); cp.end(); };
   const grid = n => { const nWG = Math.ceil(n / 256), gx = Math.min(65535, nWG); return { gx, wg: [gx, Math.ceil(nWG / gx), 1] }; };
-  return { pipe, uni, pass, grid, CONV, CONV_VSM, IN_STATS, IN_APPLY, IN_APPLY_LEAKY, ADD, LEAKY, POOL, RESIZE };
+  return { pipe, uni, pass, grid, CONV, CONV_VSM, IN_STATS, IN_APPLY, IN_APPLY_LEAKY, ADD, LEAKY, POOL, RESIZE, ARGMAX };
 }
