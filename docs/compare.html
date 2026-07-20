@@ -84,6 +84,7 @@ const SRV=()=>$('srv').value.trim().replace(/\/$/,'');
 let Z,Y,X, ct,vol,lab=null, maskL,maskR, stats=null, inter=null, entry=null;
 let center=null, curZoom=1, clicksAll=[];
 let modelReady=false, ctReady=false, srvReady=false, busyL=false, azp=null;
+let phase='zoom', refTiles=[], refIdx=0, inferZoom=1, MAX_REFINE_TILES=12;
 let liveQ=[], srvQ=[], srvBusy=false, anyRounds=false;
 
 // ---------- progress bar ----------
@@ -132,18 +133,33 @@ function pasteMaskL(m, ctr, zoom){ const size=Math.round(P*zoom); const [oz,oy,o
   inter.prev=maskL; }
 function borderCount(m){ let n=0; const F=P-1; for(let a=0;a<P;a++)for(let b=0;b<P;b++){
   if(m[(0*P+a)*P+b])n++; if(m[(F*P+a)*P+b])n++; if(m[(a*P+0)*P+b])n++; if(m[(a*P+F)*P+b])n++; if(m[(a*P+b)*P+0])n++; if(m[(a*P+b)*P+F])n++; } return n; }
-function encL(ctr,zoom){ const crop=extractCrop(vol,Z,Y,X,ctr,P,zoom,stats.mean,stats.std); worker.postMessage({type:'encode',image:crop.buffer,ctr,zoom},[crop.buffer]); }
+function encL(ctr,zoom){ inferZoom=zoom; const crop=extractCrop(vol,Z,Y,X,ctr,P,zoom,stats.mean,stats.std); worker.postMessage({type:'encode',image:crop.buffer,ctr,zoom},[crop.buffer]); }
 function infL(ctr,zoom){ const i7=inter.buildInter(ctr,P,zoom); worker.postMessage({type:'infer',inter:i7.buffer},[i7.buffer]); }
-function startL(ctr){ busyL=true; center=ctr; curZoom=1; azp={zoom:1}; $('statL').innerHTML='<span class="work">encoding…</span>'; encL(ctr,1); }
+function startL(ctr){ busyL=true; center=ctr; curZoom=1; azp={zoom:1}; phase='zoom'; refTiles=[]; $('statL').innerHTML='<span class="work">encoding…</span>'; encL(ctr,1); }
+// native-res refinement (matches nnInteractive: after zoom-out, refine the object at full res over tiled 192³ boxes)
+function objectBbox(m){ let z0=1e9,z1=-1,y0=1e9,y1=-1,x0=1e9,x1=-1;
+  for(let z=0;z<Z;z++)for(let y=0;y<Y;y++){ const r=(z*Y+y)*X; for(let x=0;x<X;x++) if(m[r+x]){ if(z<z0)z0=z;if(z>z1)z1=z;if(y<y0)y0=y;if(y>y1)y1=y;if(x<x0)x0=x;if(x>x1)x1=x; } }
+  return z1<0?null:[z0,z1,y0,y1,x0,x1]; }
+function tileCenters(bb,P,margin){ const step=P-2*margin, h=P>>1;
+  const ax=(lo,hi)=>{ if(hi-lo+1<=P) return [Math.round((lo+hi)/2)]; const c=[]; for(let p=lo+h; p<hi-h+step; p+=step) c.push(p); return c.length?c:[Math.round((lo+hi)/2)]; };
+  const t=[]; for(const z of ax(bb[0],bb[1]))for(const y of ax(bb[2],bb[3]))for(const x of ax(bb[4],bb[5])) t.push([z,y,x]); return t; }
+function finishL(){ busyL=false; let v=0; for(let i=0;i<maskL.length;i++)v+=maskL[i];
+  $('statL').innerHTML=`<span class="pass">${v.toLocaleString()} vox</span> · z×${curZoom}${refTiles.length?` · refined ${refTiles.length}`:''}`; draw(); pumpLive(); }
 worker.onmessage=(e)=>{ const d=e.data;
   if(d.type==='progress' && d.what==='model'){ const mb=(d.loaded/1e6).toFixed(0);
     bar(d.total? `downloading nnLive model  ${mb} / ${(d.total/1e6).toFixed(0)} MB` : `downloading nnLive model  ${mb} MB…`, d.total? d.loaded/d.total : null); }
   else if(d.type==='ready'){ modelReady=true; bar(null); $('gpu').innerHTML=$('gpu').innerHTML.replace(/ · (loading|downloading).*/,'')+` · ~${(d.ms/1000).toFixed(1)}s/click`; log(`nnLive model ready (${(d.ms/1000).toFixed(1)}s/click)`); maybeEnable(); }
-  else if(d.type==='encoded'){ $('statL').innerHTML='<span class="work">segmenting…</span>'; infL(center,azp.zoom); }
-  else if(d.type==='result'){ const m=new Uint8Array(d.mask); const bc=borderCount(m);
-    if(azp.zoom<MAX_ZOOM && bc>BORDER_ABS){ azp.zoom=Math.min(MAX_ZOOM,azp.zoom*1.5); curZoom=azp.zoom; $('statL').innerHTML=`<span class="work">zoom ×${azp.zoom}…</span>`; encL(center,azp.zoom); return; }
-    pasteMaskL(m,center,azp.zoom); busyL=false; let v=0; for(let i=0;i<maskL.length;i++)v+=maskL[i]; $('statL').innerHTML=`<span class="pass">${v.toLocaleString()} vox</span> · z×${curZoom}`; draw();
-    pumpLive(); }
+  else if(d.type==='encoded'){ $('statL').innerHTML=`<span class="work">${phase==='refine'?`refining ${refIdx+1}/${refTiles.length}`:'segmenting'}…</span>`; infL(center,inferZoom); }
+  else if(d.type==='result'){ const m=new Uint8Array(d.mask);
+    if(phase==='zoom'){ const bc=borderCount(m);
+      if(azp.zoom<MAX_ZOOM && bc>BORDER_ABS){ azp.zoom=Math.min(MAX_ZOOM,azp.zoom*1.5); curZoom=azp.zoom; $('statL').innerHTML=`<span class="work">zoom ×${azp.zoom}…</span>`; encL(center,azp.zoom); return; }
+      pasteMaskL(m,center,azp.zoom); draw();
+      if(curZoom>1){ const bb=objectBbox(maskL); refTiles=bb?tileCenters(bb,P,16).slice(0,MAX_REFINE_TILES):[]; refIdx=0;
+        if(refTiles.length){ phase='refine'; center=refTiles[0]; encL(center,1); return; } }
+      finishL(); }
+    else { pasteMaskL(m,refTiles[refIdx],1); refIdx++; draw();
+      if(refIdx<refTiles.length){ center=refTiles[refIdx]; encL(center,1); return; }
+      finishL(); } }
   else if(d.type==='error'){ busyL=false; $('statL').innerHTML=`<span class="fail">✗</span>`; log('nnLive ✗ '+d.msg); pumpLive(); }
 };
 
