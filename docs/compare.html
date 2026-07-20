@@ -241,7 +241,30 @@ async function prepareOrUpload(){
   bar('server assembling volume…', null);
   const r=await (await fetchRetry(SRV()+'/upload_finalize?'+q,{method:'POST'})).json();
   imageHash=r.hash||null; log(`uploaded ${JSON.stringify(r.shape_zyx)} in ${total} chunks (${(body.length/1e6).toFixed(1)}MB gz) → stored once in Ceph as ${(''+r.hash).slice(0,12)}`); bar(null); }
-async function onCT(c){ vol=c.vol; [X,Y,Z]=[c.dims[0],c.dims[1],c.dims[2]]; window.__ijk=c.ijkToRAS; window.__spc=c.spacing||[];
+// nnInteractive is trained at 1.5mm isotropic and does NOT resample internally — so BOTH nnLive and the
+// volume sent to nnInteractive must be resampled to 1.5mm. Native IDC CT is often ~0.7mm → ~2x scale error.
+const TS=1.5;
+function spacingFromIjk(M){ if(!M||M.length<11) return [1,1,1]; const col=c=>Math.hypot(M[c],M[4+c],M[8+c]); return [col(0),col(1),col(2)]; } // [sx(i),sy(j),sz(k)]
+function resampleTo15(v, X, Y, Z, sp){                     // trilinear resample Int16 [z][y][x] -> 1.5mm iso
+  const nX=Math.max(1,Math.round(X*sp[0]/TS)), nY=Math.max(1,Math.round(Y*sp[1]/TS)), nZ=Math.max(1,Math.round(Z*sp[2]/TS));
+  const out=new Int16Array(nX*nY*nZ), ax=(X-1)/Math.max(1,nX-1), ay=(Y-1)/Math.max(1,nY-1), az=(Z-1)/Math.max(1,nZ-1);
+  for(let z=0;z<nZ;z++){ const fz=z*az, z0=fz|0, z1=Math.min(Z-1,z0+1), dz=fz-z0;
+    for(let y=0;y<nY;y++){ const fy=y*ay, y0=fy|0, y1=Math.min(Y-1,y0+1), dy=fy-y0; const orow=(z*nY+y)*nX;
+      for(let x=0;x<nX;x++){ const fx=x*ax, x0=fx|0, x1=Math.min(X-1,x0+1), dx=fx-x0;
+        const b00=(z0*Y+y0)*X, b01=(z0*Y+y1)*X, b10=(z1*Y+y0)*X, b11=(z1*Y+y1)*X;
+        const c00=v[b00+x0]*(1-dx)+v[b00+x1]*dx, c01=v[b01+x0]*(1-dx)+v[b01+x1]*dx,
+              c10=v[b10+x0]*(1-dx)+v[b10+x1]*dx, c11=v[b11+x0]*(1-dx)+v[b11+x1]*dx;
+        const c0=c00*(1-dy)+c01*dy, c1=c10*(1-dy)+c11*dy;
+        out[orow+x]=Math.round(c0*(1-dz)+c1*dz); } } }
+  return {vol:out, dims:[nX,nY,nZ]};
+}
+async function onCT(c){
+  const sp=spacingFromIjk(c.ijkToRAS); window.__ijk=c.ijkToRAS; window.__spc=sp;
+  const near15=sp.every(s=>Math.abs(s-TS)<0.05);
+  if(near15){ vol=c.vol; [X,Y,Z]=[c.dims[0],c.dims[1],c.dims[2]]; }
+  else { bar(`resampling ${c.dims[0]}×${c.dims[1]}×${c.dims[2]} @ [${sp.map(s=>s.toFixed(2)).join(',')}]mm → 1.5mm…`, null);
+    await new Promise(r=>setTimeout(r,0)); const rr=resampleTo15(c.vol,c.dims[0],c.dims[1],c.dims[2],sp);
+    vol=rr.vol; [X,Y,Z]=rr.dims; log(`resampled to 1.5mm iso: ${X}×${Y}×${Z}`); bar(null); }
   const lo=c.lev-c.win/2, sc=255/c.win; ct=new Uint8Array(Z*Y*X);
   for(let i=0;i<ct.length;i++){ let g=(vol[i]-lo)*sc; ct[i]=g<0?0:g>255?255:g; }
   maskL=new Uint8Array(Z*Y*X); maskR=new Uint8Array(Z*Y*X); inter=new Interactions(Z,Y,X); stats=globalStats(vol);
