@@ -13,6 +13,21 @@ async function fetchProgress(url, onProg) {
   for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); loaded += value.length; onProg && onProg(loaded, total); }
   return new Blob(chunks, { type: 'application/octet-stream' });
 }
+// Cache the (188MB) weights in Cache Storage; reuse across reloads if the bucket ETag is unchanged.
+async function cachedFetch(url, onProg) {
+  const key = url.split('?')[0];
+  let etag = null;
+  try { const h = await fetch(url, { method: 'HEAD' }); etag = h.headers.get('etag'); } catch (e) { /* offline */ }
+  let cache = null;
+  try { cache = await caches.open('nnlive-weights'); } catch (e) { /* no Cache API */ }
+  if (cache) {
+    const hit = await cache.match(key);
+    if (hit && (!etag || hit.headers.get('x-etag') === etag)) { onProg && onProg(0, 0, true); return await hit.blob(); }
+  }
+  const blob = await fetchProgress(url, onProg);
+  if (cache) { try { await cache.put(key, new Response(blob, { headers: { 'x-etag': etag || '', 'content-type': 'application/octet-stream' } })); } catch (e) { /* quota */ } }
+  return blob;
+}
 // Weights may be a single .bin (bucket) or a chunk manifest .json. Stream to a blob URL with progress.
 async function resolveWeights(url, onProg) {
   if (/\.json(\?|$)/.test(url)) {
@@ -22,7 +37,7 @@ async function resolveWeights(url, onProg) {
     for (const p of man.parts) { const b = await fetchProgress(dir + p, (l) => onProg && onProg(loaded + l, total)); bufs.push(await b.arrayBuffer()); loaded += bufs[bufs.length - 1].byteLength; onProg && onProg(loaded, total); }
     return URL.createObjectURL(new Blob(bufs, { type: 'application/octet-stream' }));
   }
-  const blob = await fetchProgress(url, onProg);
+  const blob = await cachedFetch(url, onProg);
   return URL.createObjectURL(blob);
 }
 
@@ -38,7 +53,7 @@ self.onmessage = async (e) => {
       ({ dev } = await initDevice()); R = makeRunner(dev);
       const trunk = new Net(dev, R); await trunk.load(`${base}trunk8_${P}.graph.json${qv}`, `${base}trunk8_${P}.weights.bin${qv}`);
       self.postMessage({ type: 'progress', what: 'model', loaded: 0, total: 0 });
-      const pcUrl = await resolveWeights(pcW, (loaded, total) => self.postMessage({ type: 'progress', what: 'model', loaded, total }));
+      const pcUrl = await resolveWeights(pcW, (loaded, total, cached) => self.postMessage({ type: 'progress', what: 'model', loaded, total, cached }));
       const perclick = new Net(dev, R); await perclick.load(`${base}perclick_${P}.graph.json${qv}`, pcUrl);   // pcUrl is a blob: URL
       trunk.setInputData('img8', new Float32Array(8*N));
       perclick.setInputData('inter', new Float32Array(7*N));

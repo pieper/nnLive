@@ -146,8 +146,9 @@ function tileCenters(bb,P,margin){ const step=P-2*margin, h=P>>1;
 function finishL(){ busyL=false; let v=0; for(let i=0;i<maskL.length;i++)v+=maskL[i];
   $('statL').innerHTML=`<span class="pass">${v.toLocaleString()} vox</span> · z×${curZoom}${refTiles.length?` · refined ${refTiles.length}`:''}`; draw(); pumpLive(); }
 worker.onmessage=(e)=>{ const d=e.data;
-  if(d.type==='progress' && d.what==='model'){ const mb=(d.loaded/1e6).toFixed(0);
-    bar(d.total? `downloading nnLive model  ${mb} / ${(d.total/1e6).toFixed(0)} MB` : `downloading nnLive model  ${mb} MB…`, d.total? d.loaded/d.total : null); }
+  if(d.type==='progress' && d.what==='model'){
+    if(d.cached){ bar('loading cached model…', null); }
+    else { const mb=(d.loaded/1e6).toFixed(0); bar(d.total? `downloading nnLive model  ${mb} / ${(d.total/1e6).toFixed(0)} MB` : `downloading nnLive model  ${mb} MB…`, d.total? d.loaded/d.total : null); } }
   else if(d.type==='ready'){ modelReady=true; bar(null); $('gpu').innerHTML=$('gpu').innerHTML.replace(/ · (loading|downloading).*/,'')+` · ~${(d.ms/1000).toFixed(1)}s/click`; log(`nnLive model ready (${(d.ms/1000).toFixed(1)}s/click)`); maybeEnable(); }
   else if(d.type==='encoded'){ $('statL').innerHTML=`<span class="work">${phase==='refine'?`refining ${refIdx+1}/${refTiles.length}`:'segmenting'}…</span>`; infL(center,inferZoom); }
   else if(d.type==='result'){ const m=new Uint8Array(d.mask);
@@ -195,9 +196,9 @@ async function pumpSrv(){ if(srvBusy||!srvQ.length) return; srvBusy=true; const 
 
 // ---------- pointer ----------
 let drag=null;
-function toVox(cv,ev){ const r=cv.getBoundingClientRect();
-  return { x:Math.max(0,Math.min(X-1,Math.floor((ev.clientX-r.left)/(cv.width/X)))),
-           y:Math.max(0,Math.min(Y-1,Math.floor((ev.clientY-r.top)/(cv.height/Y)))), z:+$('z').value }; }
+function toVox(cv,ev){ const r=cv.getBoundingClientRect();   // use DISPLAYED size (canvas is CSS-scaled), not the internal buffer
+  return { x:Math.max(0,Math.min(X-1,Math.floor((ev.clientX-r.left)/(r.width/X)))),
+           y:Math.max(0,Math.min(Y-1,Math.floor((ev.clientY-r.top)/(r.height/Y)))), z:+$('z').value }; }
 for(const cv of [cvL,cvR]){
   cv.addEventListener('mousedown',ev=>{ if(!ready())return; const sign=(ev.shiftKey||ev.button===2)?-1:1; const v=toVox(cv,ev);
     if($('mode').value==='point'){ ev.preventDefault(); annotate('point',{z:v.z,y:v.y,x:v.x,sign}); }
@@ -225,9 +226,12 @@ $('approve').onclick=async()=>{
 };
 
 // ---------- readiness ----------
+let autoSpun=false;
 function ready(){ return modelReady && ctReady && srvReady; }
 function maybeEnable(){ $('spin').disabled=!(modelReady&&srvReady);
-  if(ready()) sub.innerHTML='<span class="pass">ready</span> — annotate on either panel; both compute.'; }
+  if(ready()) sub.innerHTML='<span class="pass">ready</span> — annotate on either panel; both compute.';
+  if(modelReady && srvReady && !autoSpun){ autoSpun=true; spin(); }   // auto-spin the first case once loaded
+}
 
 // ---------- server ping ----------
 async function ping(){ try{ const h=await (await fetch(SRV()+'/health')).json(); srvReady=h.status==='ok';
