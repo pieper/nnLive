@@ -26,6 +26,12 @@
   #log{white-space:pre-wrap;background:#0e1220;border:1px solid #1c2130;padding:6px 9px;border-radius:6px;font-family:ui-monospace,monospace;font-size:10.5px;max-height:26vh;overflow:auto;margin-top:10px}
   .pass{color:#57d98a;font-weight:600}.fail{color:#ff6b74;font-weight:600}.work{color:#ffb27a;font-weight:600}
   .muted{color:#8aa0c0}
+  #pbar{display:none;align-items:center;gap:10px;margin:8px 0}
+  #pbar .track{flex:1;max-width:520px;height:10px;border-radius:6px;background:#1a2233;overflow:hidden}
+  #pbar .track>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#54c6f0,#9fe9ff);transition:width .15s}
+  #pbar.indet .track>i{width:35%;animation:slide 1.1s ease-in-out infinite}
+  @keyframes slide{0%{margin-left:-35%}100%{margin-left:100%}}
+  #pmsg{font-size:12px;color:#9fb3d0;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -40,8 +46,7 @@
 
 <main>
   <div class="ctl">
-    <button id="spinCT" class="primary" disabled>Spin CT</button>
-    <button id="spinMR" disabled>Spin MR</button>
+    <button id="spin" class="primary" disabled>Spin CT/MR</button>
     <select id="mode"><option value="point">point</option><option value="scribble">scribble</option></select>
     slice <input id="z" type="range" min="0" max="1" value="0" style="width:200px"> <span id="zv">0</span>
     <button id="newobj">new object</button>
@@ -50,6 +55,7 @@
     <button id="approve" class="ok" disabled>✓ Approve → save</button>
     <button id="discard" class="bad" disabled>✗ Discard</button>
   </div>
+  <div id="pbar"><div class="track"><i></i></div><span id="pmsg"></span></div>
   <p id="sub" class="muted">Paste the A100 server URL, then Spin a case. Left-click = +, Shift/right-click = −. Same annotations drive both panels.</p>
   <div class="views">
     <div class="view"><h2><span>nnLive · WebGPU (local)</span><span id="statL" class="muted"></span></h2><canvas id="cvL"></canvas></div>
@@ -77,8 +83,14 @@ const SRV=()=>$('srv').value.trim().replace(/\/$/,'');
 // ---------- state ----------
 let Z,Y,X, ct,vol,lab=null, maskL,maskR, stats=null, inter=null, entry=null;
 let center=null, curZoom=1, clicksAll=[];
-let modelReady=false, ctReady=false, srvReady=false, busyL=false, azp=null, pend=null;
-let anyRounds=false;
+let modelReady=false, ctReady=false, srvReady=false, busyL=false, azp=null;
+let liveQ=[], srvQ=[], srvBusy=false, anyRounds=false;
+
+// ---------- progress bar ----------
+function bar(msg, frac){ const p=$('pbar'); if(msg==null){ p.style.display='none'; return; }
+  p.style.display='flex'; $('pmsg').textContent=msg;
+  if(frac==null){ p.classList.add('indet'); p.querySelector('i').style.width='35%'; }
+  else { p.classList.remove('indet'); p.querySelector('i').style.width=Math.round(frac*100)+'%'; } }
 const cvL=$('cvL'), cxL=cvL.getContext('2d'), cvR=$('cvR'), cxR=cvR.getContext('2d');
 const worker=new Worker('js/pathA-faithful-worker.js?v=3',{type:'module'});
 
@@ -118,13 +130,15 @@ function encL(ctr,zoom){ const crop=extractCrop(vol,Z,Y,X,ctr,P,zoom,stats.mean,
 function infL(ctr,zoom){ const i7=inter.buildInter(ctr,P,zoom); worker.postMessage({type:'infer',inter:i7.buffer},[i7.buffer]); }
 function startL(ctr){ busyL=true; center=ctr; curZoom=1; azp={zoom:1}; $('statL').innerHTML='<span class="work">encoding…</span>'; encL(ctr,1); }
 worker.onmessage=(e)=>{ const d=e.data;
-  if(d.type==='ready'){ modelReady=true; $('gpu').innerHTML=$('gpu').innerHTML.replace(/loading.*/,'')+` · ~${(d.ms/1000).toFixed(1)}s/click`; log(`nnLive model ready (${(d.ms/1000).toFixed(1)}s/click)`); maybeEnable(); }
+  if(d.type==='progress' && d.what==='model'){ const mb=(d.loaded/1e6).toFixed(0);
+    bar(d.total? `downloading nnLive model  ${mb} / ${(d.total/1e6).toFixed(0)} MB` : `downloading nnLive model  ${mb} MB…`, d.total? d.loaded/d.total : null); }
+  else if(d.type==='ready'){ modelReady=true; bar(null); $('gpu').innerHTML=$('gpu').innerHTML.replace(/ · (loading|downloading).*/,'')+` · ~${(d.ms/1000).toFixed(1)}s/click`; log(`nnLive model ready (${(d.ms/1000).toFixed(1)}s/click)`); maybeEnable(); }
   else if(d.type==='encoded'){ $('statL').innerHTML='<span class="work">segmenting…</span>'; infL(center,azp.zoom); }
   else if(d.type==='result'){ const m=new Uint8Array(d.mask); const bc=borderCount(m);
     if(azp.zoom<MAX_ZOOM && bc>BORDER_ABS){ azp.zoom=Math.min(MAX_ZOOM,azp.zoom*1.5); curZoom=azp.zoom; $('statL').innerHTML=`<span class="work">zoom ×${azp.zoom}…</span>`; encL(center,azp.zoom); return; }
     pasteMaskL(m,center,azp.zoom); busyL=false; let v=0; for(let i=0;i<maskL.length;i++)v+=maskL[i]; $('statL').innerHTML=`<span class="pass">${v.toLocaleString()} vox</span> · z×${curZoom}`; draw();
-    if(pend){ const p=pend; pend=null; annotate(p.type,p); } }
-  else if(d.type==='error'){ busyL=false; $('statL').innerHTML=`<span class="fail">✗</span>`; log('nnLive ✗ '+d.msg); }
+    pumpLive(); }
+  else if(d.type==='error'){ busyL=false; $('statL').innerHTML=`<span class="fail">✗</span>`; log('nnLive ✗ '+d.msg); pumpLive(); }
 };
 
 // ---------- nnInteractive (right) — server ----------
@@ -140,18 +154,22 @@ async function scribbleR(pts,positive){ $('statR').innerHTML='<span class="work"
   maskR=await maskFromResp(resp,Z*Y*X); let v=0; for(let i=0;i<maskR.length;i++)v+=maskR[i];
   $('statR').innerHTML=`<span class="pass">${v.toLocaleString()} vox</span> · ${Math.round(performance.now()-t)}ms`; draw(); }
 
-// ---------- unified annotate (drives BOTH) ----------
+// ---------- annotate: enqueue to BOTH panels; each drains its own queue in order, independently ----------
+// (nnInteractive is fast and must NOT wait on nnLive's slow per-click compute — that dropped/delayed clicks.)
 function annotate(type, a){
   if(!ready()){ log('…not ready'); return; }
-  if(busyL){ pend={type,...a}; return; }
   anyRounds=true; $('approve').disabled=false; $('discard').disabled=false;
-  if(type==='point'){ clicksAll.push({z:a.z,y:a.y,x:a.x,sign:a.sign});
-    inter.addPoint(a.z,a.y,a.x,a.sign); startL([a.z,a.y,a.x]);
-    pointR(a.z,a.y,a.x,a.sign>0).catch(e=>{$('statR').innerHTML='<span class="fail">✗ '+e.message+'</span>';log('nnInt ✗ '+e);}); }
-  else if(type==='scribble'){ inter.addScribble(a.pts,a.sign);
-    const my=a.pts.reduce((s,p)=>s+p[1],0)/a.pts.length, mx=a.pts.reduce((s,p)=>s+p[2],0)/a.pts.length; startL([a.z,Math.round(my),Math.round(mx)]);
-    scribbleR(a.pts,a.sign>0).catch(e=>{$('statR').innerHTML='<span class="fail">✗ '+e.message+'</span>';log('nnInt ✗ '+e);}); }
+  if(type==='point') clicksAll.push({z:a.z,y:a.y,x:a.x,sign:a.sign});
+  draw();
+  liveQ.push({type,a}); srvQ.push({type,a}); pumpLive(); pumpSrv();
 }
+function pumpLive(){ if(busyL||!liveQ.length) return; const {type,a}=liveQ.shift();
+  if(type==='point'){ inter.addPoint(a.z,a.y,a.x,a.sign); startL([a.z,a.y,a.x]); }
+  else { inter.addScribble(a.pts,a.sign); const my=a.pts.reduce((s,p)=>s+p[1],0)/a.pts.length, mx=a.pts.reduce((s,p)=>s+p[2],0)/a.pts.length; startL([a.z,Math.round(my),Math.round(mx)]); } }
+async function pumpSrv(){ if(srvBusy||!srvQ.length) return; srvBusy=true; const {type,a}=srvQ.shift();
+  try{ if(type==='point') await pointR(a.z,a.y,a.x,a.sign>0); else await scribbleR(a.pts,a.sign>0); }
+  catch(e){ $('statR').innerHTML='<span class="fail">✗ '+(e.message||e)+'</span>'; log('nnInt ✗ '+e); }
+  finally{ srvBusy=false; pumpSrv(); } }
 
 // ---------- pointer ----------
 let drag=null;
@@ -170,7 +188,7 @@ window.addEventListener('mouseup',()=>{ if(!drag)return; const d=drag; drag=null
 $('z').addEventListener('input',draw);
 
 // ---------- new object / approve / discard ----------
-async function resetBoth(){ if(inter)inter.clear(); clicksAll=[]; center=null; curZoom=1; if(maskL)maskL.fill(0); if(maskR)maskR.fill(0);
+async function resetBoth(){ if(inter)inter.clear(); clicksAll=[]; center=null; curZoom=1; liveQ=[]; srvQ=[]; if(maskL)maskL.fill(0); if(maskR)maskR.fill(0);
   anyRounds=false; $('approve').disabled=true; $('discard').disabled=true; draw();
   try{ await fetch(SRV()+'/reset',{method:'POST'}); }catch(e){} }
 $('newobj').onclick=resetBoth;
@@ -186,8 +204,8 @@ $('approve').onclick=async()=>{
 
 // ---------- readiness ----------
 function ready(){ return modelReady && ctReady && srvReady; }
-function maybeEnable(){ const ok=ready(); $('spinCT').disabled=!(modelReady&&srvReady); $('spinMR').disabled=!(modelReady&&srvReady);
-  if(ok) sub.innerHTML='<span class="pass">ready</span> — annotate on either panel; both compute.'; }
+function maybeEnable(){ $('spin').disabled=!(modelReady&&srvReady);
+  if(ready()) sub.innerHTML='<span class="pass">ready</span> — annotate on either panel; both compute.'; }
 
 // ---------- server ping ----------
 async function ping(){ try{ const h=await (await fetch(SRV()+'/health')).json(); srvReady=h.status==='ok';
@@ -196,13 +214,22 @@ async function ping(){ try{ const h=await (await fetch(SRV()+'/health')).json();
 $('ping').onclick=ping;
 
 // ---------- spin + upload to server ----------
-async function uploadToServer(){
+let imageHash=null;
+async function prepareOrUpload(){
+  // dedup: the A100 stores each volume in Ceph ONCE under a content hash and keeps a series->hash map,
+  // so re-spinning the same series (or making several test cases on it) never re-uploads the CT.
+  bar('checking server for this series…', null);
+  let have=null;
+  try{ have=await (await fetch(SRV()+'/prepare_image',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({series:entry?.c||'', modality:entry?.m||'', collection:entry?.col||''})})).json(); }catch(e){}
+  if(have && have.have){ imageHash=have.hash; log('server reused cached volume '+(''+have.hash).slice(0,12)+' (no upload)'); bar(null); return; }
   const raw=new Uint8Array(vol.buffer, vol.byteOffset, vol.byteLength);
-  const body=await gz(raw);
+  bar('compressing volume…', null); const body=await gz(raw);
+  bar(`uploading volume to A100  (${(body.length/1e6).toFixed(0)} MB, once per series)…`, null);
   const q=new URLSearchParams({nx:X,ny:Y,nz:Z,gzip:'1',series:entry?.c||'',modality:entry?.m||'',collection:entry?.col||'',
     ijkToRAS:JSON.stringify(window.__ijk||[]), spacing:JSON.stringify(window.__spc||[])});
   const r=await (await fetch(SRV()+'/upload_image_raw?'+q,{method:'POST',body})).json();
-  log(`uploaded to server: ${JSON.stringify(r.shape_zyx)} (${(body.length/1e6).toFixed(1)}MB gz)`); }
+  imageHash=r.hash||null; log(`uploaded ${JSON.stringify(r.shape_zyx)} (${(body.length/1e6).toFixed(1)}MB gz) → stored once in Ceph as ${(''+r.hash).slice(0,12)}`); bar(null); }
 async function onCT(c){ vol=c.vol; [X,Y,Z]=[c.dims[0],c.dims[1],c.dims[2]]; window.__ijk=c.ijkToRAS; window.__spc=c.spacing||[];
   const lo=c.lev-c.win/2, sc=255/c.win; ct=new Uint8Array(Z*Y*X);
   for(let i=0;i<ct.length;i++){ let g=(vol[i]-lo)*sc; ct[i]=g<0?0:g>255?255:g; }
@@ -210,26 +237,26 @@ async function onCT(c){ vol=c.vol; [X,Y,Z]=[c.dims[0],c.dims[1],c.dims[2]]; wind
   const w=Math.min(500,Math.round(X*1.6)); for(const cv of[cvL,cvR]){ cv.width=w; cv.height=Math.round(w*Y/X); }
   $('z').max=Z-1; $('z').value=Math.floor(Z/2);
   log(`CT ${X}×${Y}×${Z} · z-score ${stats.mean.toFixed(0)}/${stats.std.toFixed(0)}`); draw(); }
-async function spin(mod){
-  $('spinCT').disabled=true; $('spinMR').disabled=true; ctReady=false; await resetBoth();
-  sub.innerHTML='<span class="work">spinning '+mod+'…</span>';
+async function spin(){
+  $('spin').disabled=true; ctReady=false; await resetBoth(); bar('listing series…', null);
   try{
-    const res=await spinRandom({ onProgress:p=>{sub.innerHTML='<span class="work">'+p.msg+'</span>';}, onCT, onLabelmap:s=>{lab=s.lab;} },
-      { manifestUrl:'segroulette.json', filter:e=>e.m===mod });
+    const res=await spinRandom({ onProgress:p=>{ bar(p.msg, p.frac); sub.innerHTML='<span class="work">'+p.msg+'</span>'; }, onCT, onLabelmap:s=>{lab=s.lab;} },
+      { manifestUrl:'segroulette.json', filter:e=>e.m==='CT'||e.m==='MR' });
     entry=res.entry; const oh=ohifViewerURL(entry.st);
-    sub.innerHTML=`<b>${entry.m}</b> · ${entry.col}${entry.sd?' · '+entry.sd:''}`+(oh?` · <a href="${oh}" target="_blank">IDC viewer</a>`:'')+' — uploading to server…';
-    await uploadToServer(); ctReady=true; maybeEnable();
+    sub.innerHTML=`<b>${entry.m}</b> · ${entry.col}${entry.sd?' · '+entry.sd:''}`+(oh?` · <a href="${oh}" target="_blank">IDC viewer</a>`:'');
+    await prepareOrUpload(); ctReady=true; maybeEnable();
     sub.innerHTML=`<span class="pass">ready</span> · ${entry.m} ${entry.col} — annotate on either panel.`;
-  }catch(e){ sub.innerHTML=`<span class="fail">spin failed: ${e.message}</span>`; log('spin ✗ '+e); }
-  $('spinCT').disabled=false; $('spinMR').disabled=false;
+  }catch(e){ bar(null); sub.innerHTML=`<span class="fail">spin failed: ${e.message}</span>`; log('spin ✗ '+e); }
+  $('spin').disabled=false;
 }
-$('spinCT').onclick=()=>spin('CT'); $('spinMR').onclick=()=>spin('MR');
+$('spin').onclick=spin;
 
 // ---------- boot ----------
 (async()=>{
   // GPU
   try{ const ad=await navigator.gpu.requestAdapter({powerPreference:'high-performance'}); let info=ad.info||(ad.requestAdapterInfo?await ad.requestAdapterInfo():{});
-    $('gpu').textContent='GPU: '+([info.description,info.vendor,info.architecture].filter(Boolean).join(' ')||'ok')+' · loading model…'; }catch(e){ $('gpu').textContent='no WebGPU'; }
+    $('gpu').textContent='GPU: '+([info.description,info.vendor,info.architecture].filter(Boolean).join(' ')||'ok')+' · downloading model…'; }catch(e){ $('gpu').textContent='no WebGPU'; }
+  bar('downloading nnLive model…', null);
   worker.postMessage({type:'init', res:P, base:MODEL_BASE, perclickWeights:WEIGHTS_URL});
   ping();
 })();

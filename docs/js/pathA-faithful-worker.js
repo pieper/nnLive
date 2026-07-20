@@ -3,14 +3,27 @@
 import { initDevice, makeRunner, Net } from './wgpu-net.js?v=9';
 let dev, R, net = null, N = 0, P = 0;
 
-// Weights may be a single .bin (local) or a chunk manifest .json (Pages serves <50MB parts same-origin,
-// since GitHub blocks >100MB files and release assets aren't CORS-fetchable). Reassemble to a blob URL.
-async function resolveWeights(url) {
-  if (!/\.json(\?|$)/.test(url)) return url;
-  const clean = url.split('?')[0], dir = clean.slice(0, clean.lastIndexOf('/') + 1);
-  const man = await (await fetch(url)).json();
-  const bufs = await Promise.all(man.parts.map((p) => fetch(dir + p).then((r) => r.arrayBuffer())));
-  return URL.createObjectURL(new Blob(bufs, { type: 'application/octet-stream' }));
+// Stream a URL to a Blob, reporting bytes so the UI can show a download bar.
+async function fetchProgress(url, onProg) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('fetch ' + resp.status + ' ' + url);
+  const total = +resp.headers.get('content-length') || 0;
+  if (!resp.body) { const b = await resp.blob(); onProg && onProg(b.size, total || b.size); return b; }
+  const reader = resp.body.getReader(); const chunks = []; let loaded = 0;
+  for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); loaded += value.length; onProg && onProg(loaded, total); }
+  return new Blob(chunks, { type: 'application/octet-stream' });
+}
+// Weights may be a single .bin (bucket) or a chunk manifest .json. Stream to a blob URL with progress.
+async function resolveWeights(url, onProg) {
+  if (/\.json(\?|$)/.test(url)) {
+    const clean = url.split('?')[0], dir = clean.slice(0, clean.lastIndexOf('/') + 1);
+    const man = await (await fetch(url)).json();
+    const total = man.bytes || 0; let loaded = 0; const bufs = [];
+    for (const p of man.parts) { const b = await fetchProgress(dir + p, (l) => onProg && onProg(loaded + l, total)); bufs.push(await b.arrayBuffer()); loaded += bufs[bufs.length - 1].byteLength; onProg && onProg(loaded, total); }
+    return URL.createObjectURL(new Blob(bufs, { type: 'application/octet-stream' }));
+  }
+  const blob = await fetchProgress(url, onProg);
+  return URL.createObjectURL(blob);
 }
 
 self.onmessage = async (e) => {
@@ -24,8 +37,9 @@ self.onmessage = async (e) => {
       const qv = `?v=${m.v||1}`;
       ({ dev } = await initDevice()); R = makeRunner(dev);
       const trunk = new Net(dev, R); await trunk.load(`${base}trunk8_${P}.graph.json${qv}`, `${base}trunk8_${P}.weights.bin${qv}`);
-      const pcUrl = await resolveWeights(pcW);   // .json manifest -> reassembled blob URL; .bin -> passthrough
-      const perclick = new Net(dev, R); await perclick.load(`${base}perclick_${P}.graph.json${qv}`, pcUrl.startsWith('blob:') ? pcUrl : (pcUrl.includes('?') ? pcUrl : pcUrl + qv));
+      self.postMessage({ type: 'progress', what: 'model', loaded: 0, total: 0 });
+      const pcUrl = await resolveWeights(pcW, (loaded, total) => self.postMessage({ type: 'progress', what: 'model', loaded, total }));
+      const perclick = new Net(dev, R); await perclick.load(`${base}perclick_${P}.graph.json${qv}`, pcUrl);   // pcUrl is a blob: URL
       trunk.setInputData('img8', new Float32Array(8*N));
       perclick.setInputData('inter', new Float32Array(7*N));
       // warm pass 1 = compiles shaders (slow, one-time); pass 2 = steady-state per-click cost estimate
