@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nnLive vs nnInteractive — ground-truth compare & capture</title>
+<style>
+  :root{ color-scheme:dark; }
+  *{box-sizing:border-box}
+  body{font:13px/1.5 -apple-system,system-ui,sans-serif;margin:0;background:#0a0c12;color:#e7ecf5}
+  header{padding:10px 16px;border-bottom:1px solid #1c2130;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  header h1{font-size:1.05rem;margin:0;font-weight:700}
+  input[type=text]{font:inherit;background:#0e1220;border:1px solid #2c3448;color:#e7ecf5;border-radius:6px;padding:.25rem .5rem;min-width:340px}
+  button{font:inherit;padding:.3rem .7rem;border-radius:6px;border:1px solid #2c3448;background:#161c2b;color:#e7ecf5;cursor:pointer}
+  button.primary{border:0;color:#04121c;background:linear-gradient(180deg,#9fe9ff,#54c6f0);font-weight:700}
+  button.ok{border:0;color:#04121c;background:linear-gradient(180deg,#8ef0b0,#3fd07a);font-weight:700}
+  button.bad{border:0;color:#fff;background:linear-gradient(180deg,#ff7a85,#e0424f);font-weight:700}
+  button:disabled{opacity:.45;cursor:default}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block;background:#c0242b}.dot.up{background:#3fd07a}
+  main{padding:12px 16px}
+  .views{display:flex;gap:16px;flex-wrap:wrap}
+  .view{flex:1;min-width:320px}
+  .view h2{font-size:.9rem;margin:.2rem 0;color:#9fb3d0;display:flex;justify-content:space-between}
+  canvas{image-rendering:pixelated;border:1px solid #232a3b;border-radius:6px;background:#000;cursor:crosshair;width:100%;max-width:520px}
+  .ctl{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin:.5rem 0}
+  #log{white-space:pre-wrap;background:#0e1220;border:1px solid #1c2130;padding:6px 9px;border-radius:6px;font-family:ui-monospace,monospace;font-size:10.5px;max-height:26vh;overflow:auto;margin-top:10px}
+  .pass{color:#57d98a;font-weight:600}.fail{color:#ff6b74;font-weight:600}.work{color:#ffb27a;font-weight:600}
+  .muted{color:#8aa0c0}
+</style>
+</head>
+<body>
+<header>
+  <h1>nnLive ⟷ nnInteractive</h1>
+  <span class="muted">ground-truth capture</span>
+  <span><span id="srvdot" class="dot"></span> server</span>
+  <input id="srv" type="text" placeholder="https://…trycloudflare.com" title="A100 nnInteractive server URL">
+  <button id="ping">check</button>
+  <span id="gpu" class="muted">GPU…</span>
+</header>
+
+<main>
+  <div class="ctl">
+    <button id="spinCT" class="primary" disabled>Spin CT</button>
+    <button id="spinMR" disabled>Spin MR</button>
+    <select id="mode"><option value="point">point</option><option value="scribble">scribble</option></select>
+    slice <input id="z" type="range" min="0" max="1" value="0" style="width:200px"> <span id="zv">0</span>
+    <button id="newobj">new object</button>
+    <span style="flex:1"></span>
+    <input id="notes" type="text" placeholder="notes (optional)" style="min-width:180px">
+    <button id="approve" class="ok" disabled>✓ Approve → save</button>
+    <button id="discard" class="bad" disabled>✗ Discard</button>
+  </div>
+  <p id="sub" class="muted">Paste the A100 server URL, then Spin a case. Left-click = +, Shift/right-click = −. Same annotations drive both panels.</p>
+  <div class="views">
+    <div class="view"><h2><span>nnLive · WebGPU (local)</span><span id="statL" class="muted"></span></h2><canvas id="cvL"></canvas></div>
+    <div class="view"><h2><span>nnInteractive · A100 (ground truth)</span><span id="statR" class="muted"></span></h2><canvas id="cvR"></canvas></div>
+  </div>
+  <div id="log"></div>
+</main>
+
+<script type="module">
+import { spinRandom, ohifViewerURL } from './idc_tools/index.js';
+import { Interactions, extractCrop, globalStats, boxOrigin } from './js/faithful-enc.js';
+const $=id=>document.getElementById(id);
+const logEl=$('log'), sub=$('sub'), lines=[];
+const log=s=>{lines.push(s);logEl.textContent=lines.join('\n');logEl.scrollTop=logEl.scrollHeight;console.log('[cmp] '+s);};
+const t0=performance.now(), clk=()=>((performance.now()-t0)/1000).toFixed(1)+'s';
+const P=192, MAX_ZOOM=4, BORDER_ABS=1200;
+const WEIGHTS_URL='https://js2.jetstream-cloud.org:8001/swift/v1/nnlive-models/perclick_192.weights.bin';
+const MODEL_BASE=new URL('models/pathA/faithful/', location.href).href;
+
+// server url (localStorage)
+$('srv').value = localStorage.getItem('nnint_srv') || 'https://passage-polished-overcome-neck.trycloudflare.com';
+$('srv').onchange=()=>localStorage.setItem('nnint_srv', $('srv').value.trim().replace(/\/$/,''));
+const SRV=()=>$('srv').value.trim().replace(/\/$/,'');
+
+// ---------- state ----------
+let Z,Y,X, ct,vol,lab=null, maskL,maskR, stats=null, inter=null, entry=null;
+let center=null, curZoom=1, clicksAll=[];
+let modelReady=false, ctReady=false, srvReady=false, busyL=false, azp=null, pend=null;
+let anyRounds=false;
+const cvL=$('cvL'), cxL=cvL.getContext('2d'), cvR=$('cvR'), cxR=cvR.getContext('2d');
+const worker=new Worker('js/pathA-faithful-worker.js?v=3',{type:'module'});
+
+// ---------- gzip / unpack helpers ----------
+async function gz(u8){ return new Uint8Array(await new Response(new Blob([u8]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer()); }
+async function gunzip(buf){ return new Uint8Array(await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer()); }
+function unpackbits(bytes, N){ const m=new Uint8Array(N); for(let i=0;i<N;i++) m[i]=(bytes[i>>3]>>(7-(i&7)))&1; return m; }
+async function maskFromResp(resp, N){ const buf=await resp.arrayBuffer(); let b=new Uint8Array(buf);
+  if(b.length!==Math.ceil(N/8)){ try{ b=await gunzip(buf); }catch(e){} } return unpackbits(b,N); }
+
+// ---------- drawing (one fn per canvas) ----------
+function drawInto(cx, cv, mask, color){
+  if(!ct) return; const z=+$('z').value;
+  const img=cx.createImageData(X,Y), o=z*Y*X;
+  for(let i=0;i<X*Y;i++){ const g=ct[o+i]; let r=g,gr=g,b=g;
+    if(mask&&mask[o+i]){ if(color==='L'){r=(r+255)>>1;gr=gr>>1;b=b>>1;} else {b=(b+255)>>1;gr=(gr+120)>>1;r=r>>1;} }
+    const p=i*4; img.data[p]=r; img.data[p+1]=gr; img.data[p+2]=b; img.data[p+3]=255; }
+  const tmp=new OffscreenCanvas(X,Y); tmp.getContext('2d').putImageData(img,0,0);
+  cx.imageSmoothingEnabled=false; cx.clearRect(0,0,cv.width,cv.height); cx.drawImage(tmp,0,0,cv.width,cv.height);
+  const sx=cv.width/X, sy=cv.height/Y;
+  for(const c of clicksAll){ if(c.z!==z) continue; cx.strokeStyle=c.sign>0?'#00e0ff':'#ff3bd0'; cx.lineWidth=2;
+    const px=c.x*sx+sx/2, py=c.y*sy+sy/2; cx.beginPath(); cx.moveTo(px-6,py); cx.lineTo(px+6,py); if(c.sign>0){cx.moveTo(px,py-6);cx.lineTo(px,py+6);} cx.stroke(); }
+  if(drag){ cx.strokeStyle=drag.sign>0?'#00e0ff':'#ff3bd0'; cx.lineWidth=1.5; cx.beginPath();
+    drag.pts.forEach((p,i)=>{const X0=p[2]*sx+sx/2,Y0=p[1]*sy+sy/2; i?cx.lineTo(X0,Y0):cx.moveTo(X0,Y0);}); cx.stroke(); }
+}
+function draw(){ $('zv').textContent=$('z').value; drawInto(cxL,cvL,maskL,'L'); drawInto(cxR,cvR,maskR,'R'); }
+
+// ---------- nnLive (left) — same flow as the live demo ----------
+function pasteMaskL(m, ctr, zoom){ const size=Math.round(P*zoom); const [oz,oy,ox]=boxOrigin(ctr,P,zoom);
+  for(let z=0;z<size;z++){ const zz=oz+z; if(zz<0||zz>=Z)continue; const pz=Math.min(P-1,Math.floor(z/zoom));
+    for(let y=0;y<size;y++){ const yy=oy+y; if(yy<0||yy>=Y)continue; const py=Math.min(P-1,Math.floor(y/zoom)); const vr=(zz*Y+yy)*X, mr=(pz*P+py)*P;
+      for(let x=0;x<size;x++){ const xx=ox+x; if(xx<0||xx>=X)continue; const px=Math.min(P-1,Math.floor(x/zoom)); maskL[vr+xx]=m[mr+px]; } } }
+  inter.prev=maskL; }
+function borderCount(m){ let n=0; const F=P-1; for(let a=0;a<P;a++)for(let b=0;b<P;b++){
+  if(m[(0*P+a)*P+b])n++; if(m[(F*P+a)*P+b])n++; if(m[(a*P+0)*P+b])n++; if(m[(a*P+F)*P+b])n++; if(m[(a*P+b)*P+0])n++; if(m[(a*P+b)*P+F])n++; } return n; }
+function encL(ctr,zoom){ const crop=extractCrop(vol,Z,Y,X,ctr,P,zoom,stats.mean,stats.std); worker.postMessage({type:'encode',image:crop.buffer,ctr,zoom},[crop.buffer]); }
+function infL(ctr,zoom){ const i7=inter.buildInter(ctr,P,zoom); worker.postMessage({type:'infer',inter:i7.buffer},[i7.buffer]); }
+function startL(ctr){ busyL=true; center=ctr; curZoom=1; azp={zoom:1}; $('statL').innerHTML='<span class="work">encoding…</span>'; encL(ctr,1); }
+worker.onmessage=(e)=>{ const d=e.data;
+  if(d.type==='ready'){ modelReady=true; $('gpu').innerHTML=$('gpu').innerHTML.replace(/loading.*/,'')+` · ~${(d.ms/1000).toFixed(1)}s/click`; log(`nnLive model ready (${(d.ms/1000).toFixed(1)}s/click)`); maybeEnable(); }
+  else if(d.type==='encoded'){ $('statL').innerHTML='<span class="work">segmenting…</span>'; infL(center,azp.zoom); }
+  else if(d.type==='result'){ const m=new Uint8Array(d.mask); const bc=borderCount(m);
+    if(azp.zoom<MAX_ZOOM && bc>BORDER_ABS){ azp.zoom=Math.min(MAX_ZOOM,azp.zoom*1.5); curZoom=azp.zoom; $('statL').innerHTML=`<span class="work">zoom ×${azp.zoom}…</span>`; encL(center,azp.zoom); return; }
+    pasteMaskL(m,center,azp.zoom); busyL=false; let v=0; for(let i=0;i<maskL.length;i++)v+=maskL[i]; $('statL').innerHTML=`<span class="pass">${v.toLocaleString()} vox</span> · z×${curZoom}`; draw();
+    if(pend){ const p=pend; pend=null; annotate(p.type,p); } }
+  else if(d.type==='error'){ busyL=false; $('statL').innerHTML=`<span class="fail">✗</span>`; log('nnLive ✗ '+d.msg); }
+};
+
+// ---------- nnInteractive (right) — server ----------
+async function pointR(z,y,x,positive){ $('statR').innerHTML='<span class="work">nnInteractive…</span>';
+  const t=performance.now();
+  const resp=await fetch(SRV()+'/add_point_interaction',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({voxel_coord:[z,y,x],positive_click:positive})});
+  maskR=await maskFromResp(resp,Z*Y*X); let v=0; for(let i=0;i<maskR.length;i++)v+=maskR[i];
+  $('statR').innerHTML=`<span class="pass">${v.toLocaleString()} vox</span> · ${Math.round(performance.now()-t)}ms`; draw(); }
+async function scribbleR(pts,positive){ $('statR').innerHTML='<span class="work">nnInteractive…</span>'; const t=performance.now();
+  const resp=await fetch(SRV()+'/add_scribble_interaction',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({voxels:pts,positive_click:positive})});
+  maskR=await maskFromResp(resp,Z*Y*X); let v=0; for(let i=0;i<maskR.length;i++)v+=maskR[i];
+  $('statR').innerHTML=`<span class="pass">${v.toLocaleString()} vox</span> · ${Math.round(performance.now()-t)}ms`; draw(); }
+
+// ---------- unified annotate (drives BOTH) ----------
+function annotate(type, a){
+  if(!ready()){ log('…not ready'); return; }
+  if(busyL){ pend={type,...a}; return; }
+  anyRounds=true; $('approve').disabled=false; $('discard').disabled=false;
+  if(type==='point'){ clicksAll.push({z:a.z,y:a.y,x:a.x,sign:a.sign});
+    inter.addPoint(a.z,a.y,a.x,a.sign); startL([a.z,a.y,a.x]);
+    pointR(a.z,a.y,a.x,a.sign>0).catch(e=>{$('statR').innerHTML='<span class="fail">✗ '+e.message+'</span>';log('nnInt ✗ '+e);}); }
+  else if(type==='scribble'){ inter.addScribble(a.pts,a.sign);
+    const my=a.pts.reduce((s,p)=>s+p[1],0)/a.pts.length, mx=a.pts.reduce((s,p)=>s+p[2],0)/a.pts.length; startL([a.z,Math.round(my),Math.round(mx)]);
+    scribbleR(a.pts,a.sign>0).catch(e=>{$('statR').innerHTML='<span class="fail">✗ '+e.message+'</span>';log('nnInt ✗ '+e);}); }
+}
+
+// ---------- pointer ----------
+let drag=null;
+function toVox(cv,ev){ const r=cv.getBoundingClientRect();
+  return { x:Math.max(0,Math.min(X-1,Math.floor((ev.clientX-r.left)/(cv.width/X)))),
+           y:Math.max(0,Math.min(Y-1,Math.floor((ev.clientY-r.top)/(cv.height/Y)))), z:+$('z').value }; }
+for(const cv of [cvL,cvR]){
+  cv.addEventListener('mousedown',ev=>{ if(!ready())return; const sign=(ev.shiftKey||ev.button===2)?-1:1; const v=toVox(cv,ev);
+    if($('mode').value==='point'){ ev.preventDefault(); annotate('point',{z:v.z,y:v.y,x:v.x,sign}); }
+    else { ev.preventDefault(); drag={cv,sign,z:v.z,pts:[[v.z,v.y,v.x]]}; } });
+  cv.addEventListener('mousemove',ev=>{ if(!drag||drag.cv!==cv)return; const v=toVox(cv,ev); drag.pts.push([drag.z,v.y,v.x]); draw(); });
+  cv.addEventListener('contextmenu',e=>e.preventDefault());
+  cv.addEventListener('wheel',e=>{e.preventDefault(); const z=Math.max(0,Math.min(Z-1,+$('z').value+(e.deltaY>0?1:-1))); $('z').value=z; draw();},{passive:false});
+}
+window.addEventListener('mouseup',()=>{ if(!drag)return; const d=drag; drag=null; if(d.pts.length){ annotate('scribble',{z:d.z,sign:d.sign,pts:d.pts}); } });
+$('z').addEventListener('input',draw);
+
+// ---------- new object / approve / discard ----------
+async function resetBoth(){ if(inter)inter.clear(); clicksAll=[]; center=null; curZoom=1; if(maskL)maskL.fill(0); if(maskR)maskR.fill(0);
+  anyRounds=false; $('approve').disabled=true; $('discard').disabled=true; draw();
+  try{ await fetch(SRV()+'/reset',{method:'POST'}); }catch(e){} }
+$('newobj').onclick=resetBoth;
+$('discard').onclick=async()=>{ log('discarded'); await resetBoth(); };
+$('approve').onclick=async()=>{
+  $('approve').disabled=true; sub.innerHTML='<span class="work">saving test case…</span>';
+  try{ const r=await (await fetch(SRV()+'/save_testcase',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id:'', notes:$('notes').value})})).json();
+    if(r.status==='ok'){ sub.innerHTML=`<span class="pass">✓ saved ${r.id}</span> (${r.rounds} rounds) → ${r.bucket}/${r.prefix}`; log('APPROVED → '+r.bucket+'/'+r.prefix); await resetBoth(); }
+    else { sub.innerHTML=`<span class="fail">save failed: ${r.message}</span>`; $('approve').disabled=false; }
+  }catch(e){ sub.innerHTML=`<span class="fail">save error: ${e.message}</span>`; $('approve').disabled=false; }
+};
+
+// ---------- readiness ----------
+function ready(){ return modelReady && ctReady && srvReady; }
+function maybeEnable(){ const ok=ready(); $('spinCT').disabled=!(modelReady&&srvReady); $('spinMR').disabled=!(modelReady&&srvReady);
+  if(ok) sub.innerHTML='<span class="pass">ready</span> — annotate on either panel; both compute.'; }
+
+// ---------- server ping ----------
+async function ping(){ try{ const h=await (await fetch(SRV()+'/health')).json(); srvReady=h.status==='ok';
+    $('srvdot').className='dot'+(srvReady?' up':''); log('server '+(srvReady?'up':'down')); }catch(e){ srvReady=false; $('srvdot').className='dot'; log('server unreachable: '+e.message); }
+  maybeEnable(); }
+$('ping').onclick=ping;
+
+// ---------- spin + upload to server ----------
+async function uploadToServer(){
+  const raw=new Uint8Array(vol.buffer, vol.byteOffset, vol.byteLength);
+  const body=await gz(raw);
+  const q=new URLSearchParams({nx:X,ny:Y,nz:Z,gzip:'1',series:entry?.c||'',modality:entry?.m||'',collection:entry?.col||'',
+    ijkToRAS:JSON.stringify(window.__ijk||[]), spacing:JSON.stringify(window.__spc||[])});
+  const r=await (await fetch(SRV()+'/upload_image_raw?'+q,{method:'POST',body})).json();
+  log(`uploaded to server: ${JSON.stringify(r.shape_zyx)} (${(body.length/1e6).toFixed(1)}MB gz)`); }
+async function onCT(c){ vol=c.vol; [X,Y,Z]=[c.dims[0],c.dims[1],c.dims[2]]; window.__ijk=c.ijkToRAS; window.__spc=c.spacing||[];
+  const lo=c.lev-c.win/2, sc=255/c.win; ct=new Uint8Array(Z*Y*X);
+  for(let i=0;i<ct.length;i++){ let g=(vol[i]-lo)*sc; ct[i]=g<0?0:g>255?255:g; }
+  maskL=new Uint8Array(Z*Y*X); maskR=new Uint8Array(Z*Y*X); inter=new Interactions(Z,Y,X); stats=globalStats(vol);
+  const w=Math.min(500,Math.round(X*1.6)); for(const cv of[cvL,cvR]){ cv.width=w; cv.height=Math.round(w*Y/X); }
+  $('z').max=Z-1; $('z').value=Math.floor(Z/2);
+  log(`CT ${X}×${Y}×${Z} · z-score ${stats.mean.toFixed(0)}/${stats.std.toFixed(0)}`); draw(); }
+async function spin(mod){
+  $('spinCT').disabled=true; $('spinMR').disabled=true; ctReady=false; await resetBoth();
+  sub.innerHTML='<span class="work">spinning '+mod+'…</span>';
+  try{
+    const res=await spinRandom({ onProgress:p=>{sub.innerHTML='<span class="work">'+p.msg+'</span>';}, onCT, onLabelmap:s=>{lab=s.lab;} },
+      { manifestUrl:'segroulette.json', filter:e=>e.m===mod });
+    entry=res.entry; const oh=ohifViewerURL(entry.st);
+    sub.innerHTML=`<b>${entry.m}</b> · ${entry.col}${entry.sd?' · '+entry.sd:''}`+(oh?` · <a href="${oh}" target="_blank">IDC viewer</a>`:'')+' — uploading to server…';
+    await uploadToServer(); ctReady=true; maybeEnable();
+    sub.innerHTML=`<span class="pass">ready</span> · ${entry.m} ${entry.col} — annotate on either panel.`;
+  }catch(e){ sub.innerHTML=`<span class="fail">spin failed: ${e.message}</span>`; log('spin ✗ '+e); }
+  $('spinCT').disabled=false; $('spinMR').disabled=false;
+}
+$('spinCT').onclick=()=>spin('CT'); $('spinMR').onclick=()=>spin('MR');
+
+// ---------- boot ----------
+(async()=>{
+  // GPU
+  try{ const ad=await navigator.gpu.requestAdapter({powerPreference:'high-performance'}); let info=ad.info||(ad.requestAdapterInfo?await ad.requestAdapterInfo():{});
+    $('gpu').textContent='GPU: '+([info.description,info.vendor,info.architecture].filter(Boolean).join(' ')||'ok')+' · loading model…'; }catch(e){ $('gpu').textContent='no WebGPU'; }
+  worker.postMessage({type:'init', res:P, base:MODEL_BASE, perclickWeights:WEIGHTS_URL});
+  ping();
+})();
+</script>
+</body>
+</html>
