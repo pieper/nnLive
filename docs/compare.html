@@ -225,11 +225,16 @@ async function prepareOrUpload(){
   if(have && have.have){ imageHash=have.hash; log('server reused cached volume '+(''+have.hash).slice(0,12)+' (no upload)'); bar(null); return; }
   const raw=new Uint8Array(vol.buffer, vol.byteOffset, vol.byteLength);
   bar('compressing volume…', null); const body=await gz(raw);
-  bar(`uploading volume to A100  (${(body.length/1e6).toFixed(0)} MB, once per series)…`, null);
-  const q=new URLSearchParams({nx:X,ny:Y,nz:Z,gzip:'1',series:entry?.c||'',modality:entry?.m||'',collection:entry?.col||'',
+  // chunked upload — many small POSTs are robust; one big cross-origin POST to the tunnel can fail ("Failed to fetch")
+  const CH=4*1024*1024, sid=Math.random().toString(36).slice(2)+Date.now(), total=Math.ceil(body.length/CH);
+  for(let i=0;i<total;i++){ bar(`uploading volume to A100  ${i+1}/${total}  (${(body.length/1e6).toFixed(0)} MB, once per series)`, (i+1)/total);
+    const part=body.subarray(i*CH, Math.min(body.length,(i+1)*CH));
+    const rc=await fetch(SRV()+`/upload_chunk?sid=${sid}&idx=${i}`,{method:'POST',body:part}); if(!rc.ok) throw new Error('chunk '+i+' HTTP '+rc.status); }
+  const q=new URLSearchParams({sid, nx:X,ny:Y,nz:Z,gzip:'1',series:entry?.c||'',modality:entry?.m||'',collection:entry?.col||'',
     ijkToRAS:JSON.stringify(window.__ijk||[]), spacing:JSON.stringify(window.__spc||[])});
-  const r=await (await fetch(SRV()+'/upload_image_raw?'+q,{method:'POST',body})).json();
-  imageHash=r.hash||null; log(`uploaded ${JSON.stringify(r.shape_zyx)} (${(body.length/1e6).toFixed(1)}MB gz) → stored once in Ceph as ${(''+r.hash).slice(0,12)}`); bar(null); }
+  bar('server assembling volume…', null);
+  const r=await (await fetch(SRV()+'/upload_finalize?'+q,{method:'POST'})).json();
+  imageHash=r.hash||null; log(`uploaded ${JSON.stringify(r.shape_zyx)} in ${total} chunks (${(body.length/1e6).toFixed(1)}MB gz) → stored once in Ceph as ${(''+r.hash).slice(0,12)}`); bar(null); }
 async function onCT(c){ vol=c.vol; [X,Y,Z]=[c.dims[0],c.dims[1],c.dims[2]]; window.__ijk=c.ijkToRAS; window.__spc=c.spacing||[];
   const lo=c.lev-c.win/2, sc=255/c.win; ct=new Uint8Array(Z*Y*X);
   for(let i=0;i<ct.length;i++){ let g=(vol[i]-lo)*sc; ct[i]=g<0?0:g>255?255:g; }
