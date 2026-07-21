@@ -149,7 +149,11 @@ worker.onmessage=(e)=>{ const d=e.data;
   if(d.type==='progress' && d.what==='model'){
     if(d.cached){ bar('loading cached model…', null); }
     else { const mb=(d.loaded/1e6).toFixed(0); bar(d.total? `downloading nnLive model  ${mb} / ${(d.total/1e6).toFixed(0)} MB` : `downloading nnLive model  ${mb} MB…`, d.total? d.loaded/d.total : null); } }
-  else if(d.type==='ready'){ modelReady=true; bar(null); $('gpu').innerHTML=$('gpu').innerHTML.replace(/ · (loading|downloading).*/,'')+` · ~${(d.ms/1000).toFixed(1)}s/click`; log(`nnLive model ready (${(d.ms/1000).toFixed(1)}s/click)`); maybeEnable(); }
+  else if(d.type==='progress' && d.what==='tune'){ bar('autotuning conv kernels for your GPU…', null); }
+  else if(d.type==='ready'){ modelReady=true; bar(null); $('gpu').innerHTML=$('gpu').innerHTML.replace(/ · (loading|downloading).*/,'')+` · ~${(d.ms/1000).toFixed(1)}s/click`; log(`nnLive model ready (${(d.ms/1000).toFixed(1)}s/click)`);
+    const t=d.tune; if(t){ if(t.error) log('autotune error: '+t.error); else if(t.cached) log(`autotune: using cached conv ${t.TM}×${t.TN} for this GPU`); else if(t.skipped) log(`autotune: skipped (${t.refMs}ms/forward, slow GPU) · ${t.verified} configs verified`);
+      else { log(`autotune: conv ${t.TM}×${t.TN} chosen (${t.ms}ms · ${t.verified}/${t.tried} configs verified)`); try{ localStorage.setItem('nnlive_conv_'+(window.__gpuName||''), JSON.stringify({TM:t.TM,TN:t.TN})); }catch(e){} } }
+    maybeEnable(); }
   else if(d.type==='encoded'){ $('statL').innerHTML=`<span class="work">${phase==='refine'?`refining ${refIdx+1}/${refTiles.length}`:'segmenting'}…</span>`; infL(center,inferZoom); }
   else if(d.type==='result'){ const m=new Uint8Array(d.mask);
     if(phase==='zoom'){ const bc=borderCount(m);
@@ -309,9 +313,11 @@ $('spin').onclick=spin;
 (async()=>{
   // GPU
   try{ const ad=await navigator.gpu.requestAdapter({powerPreference:'high-performance'}); let info=ad.info||(ad.requestAdapterInfo?await ad.requestAdapterInfo():{});
-    $('gpu').textContent='GPU: '+([info.description,info.vendor,info.architecture].filter(Boolean).join(' ')||'ok')+' · downloading model…'; }catch(e){ $('gpu').textContent='no WebGPU'; }
+    window.__gpuName=[info.description,info.vendor,info.architecture].filter(Boolean).join(' ')||'ok';
+    $('gpu').textContent='GPU: '+window.__gpuName+' · downloading model…'; }catch(e){ $('gpu').textContent='no WebGPU'; }
   bar('downloading nnLive model…', null);
-  worker.postMessage({type:'init', res:P, base:MODEL_BASE, perclickWeights:WEIGHTS_URL});
+  let tuneCache=null; try{ tuneCache=JSON.parse(localStorage.getItem('nnlive_conv_'+(window.__gpuName||''))); }catch(e){}
+  worker.postMessage({type:'init', res:P, base:MODEL_BASE, perclickWeights:WEIGHTS_URL, tuneCache});
   ping();
 })();
 </script>

@@ -86,6 +86,44 @@ fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:v
   for(var i=0u;i<2u;i++){let gm=rowBase+ar+i; if(gm>=d.Co){continue;}
     for(var j=0u;j<8u;j++){let gn=colBase+br+j; if(gn>=Nvox){continue;} outp[gm*Nvox+gn]=f16(acc[i*8u+j])+bias[gm];}}
 }`;
+// Parameterized conv (generalizes CONV/CONV_VSM) for per-GPU autotuning. 16x16 workgroup; each thread owns a
+// TMxTN output micro-tile; tile = 16TM x 16TN; KT=16 K-tiling; vec4<f16> shared staging; f32 accumulate.
+// Same GEMM math for any (TM,TN) — a different (TM,TN) is a different tiling of the identical computation.
+function genConv(TM, TN) {
+  const AS = 64 * TM, BS = 64 * TN, ACC = TM * TN;
+  let af = '', bf = '', fma = '', wr = '';
+  for (let i = 0; i < TM; i++) af += `af[${i}u]=As[(ar+${i}u)*4u+k4];`;
+  for (let j = 0; j < TN; j++) bf += `bf[${j}u]=Bs[(br+${j}u)*4u+k4];`;
+  for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) fma += `acc[${i * TN + j}u]+=f32(dot(af[${i}u],bf[${j}u]));`;
+  for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) wr += `{let gm=rowBase+ar+${i}u;let gn=colBase+br+${j}u;if(gm<d.Co&&gn<Nvox){outp[gm*Nvox+gn]=f16(acc[${i * TN + j}u])+bias[gm];}}`;
+  return `struct D{Ci:u32,Co:u32,OD:u32,OH:u32,OW:u32,ID:u32,IH:u32,IW:u32,K:u32,S:u32,pad:u32,aux:u32};
+@group(0)@binding(0) var<storage,read> inp:array<f16>; @group(0)@binding(1) var<storage,read> wgt:array<f16>;
+@group(0)@binding(2) var<storage,read> bias:array<f16>; @group(0)@binding(3) var<storage,read_write> outp:array<f16>;
+@group(0)@binding(4) var<uniform> d:D;
+var<workgroup> As:array<vec4<f16>,${AS}>; var<workgroup> Bs:array<vec4<f16>,${BS}>;
+fn gB(gk:u32,oz:u32,oy:u32,ox:u32)->f16{ let taps=d.K*d.K*d.K; let ci=gk/taps; let tap=gk%taps;
+  let kz=tap/(d.K*d.K); let ky=(tap/d.K)%d.K; let kx=tap%d.K;
+  let iz=i32(oz*d.S)+i32(kz)-i32(d.pad); let iy=i32(oy*d.S)+i32(ky)-i32(d.pad); let ix=i32(ox*d.S)+i32(kx)-i32(d.pad);
+  if(iz<0||iz>=i32(d.ID)||iy<0||iy>=i32(d.IH)||ix<0||ix>=i32(d.IW)){return f16(0);}
+  return inp[((ci*d.ID+u32(iz))*d.IH+u32(iy))*d.IW+u32(ix)]; }
+@compute @workgroup_size(16,16)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let Nvox=d.OD*d.OH*d.OW; let Ktot=d.Ci*d.K*d.K*d.K; let Ktiles=(Ktot+15u)/16u;
+  let tid=lid.y*16u+lid.x; let rowBase=wid.y*${16 * TM}u; let ntile=wid.z*d.aux+wid.x; let colBase=ntile*${16 * TN}u;
+  let OHW=d.OH*d.OW; let ar=lid.y*${TM}u; let br=lid.x*${TN}u;
+  var acc:array<f32,${ACC}>; for(var i=0u;i<${ACC}u;i++){acc[i]=0.0;}
+  for(var kk:u32=0u;kk<Ktiles;kk++){
+    for(var e=tid;e<${AS}u;e+=256u){ let m=e/4u;let k4=e%4u;let gm=rowBase+m;let base=kk*16u+k4*4u; var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gm<d.Co){let o=gm*Ktot+base; if(base<Ktot){v.x=wgt[o];} if(base+1u<Ktot){v.y=wgt[o+1u];} if(base+2u<Ktot){v.z=wgt[o+2u];} if(base+3u<Ktot){v.w=wgt[o+3u];}} As[e]=v; }
+    for(var e=tid;e<${BS}u;e+=256u){ let n=e/4u;let k4=e%4u;let gn=colBase+n;let base=kk*16u+k4*4u; var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gn<Nvox){let oz=gn/OHW;let rem=gn%OHW;let oy=rem/d.OW;let ox=rem%d.OW; v.x=gB(base,oz,oy,ox);v.y=gB(base+1u,oz,oy,ox);v.z=gB(base+2u,oz,oy,ox);v.w=gB(base+3u,oz,oy,ox);} Bs[e]=v; }
+    workgroupBarrier();
+    for(var k4=0u;k4<4u;k4++){ var af:array<vec4<f16>,${TM}>; var bf:array<vec4<f16>,${TN}>; ${af} ${bf} ${fma} }
+    workgroupBarrier();
+  }
+  ${wr}
+}`;
+}
 const IN_STATS = `struct P{C:u32,N:u32}; @group(0)@binding(0) var<storage,read> x:array<f16>;
 @group(0)@binding(1) var<storage,read_write> st:array<f32>; @group(0)@binding(2) var<uniform> p:P;
 var<workgroup> ss:array<f32,256>; var<workgroup> sq:array<f32,256>;
@@ -145,7 +183,7 @@ fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:v
 // Reusable graph net: load graph.json + weights.bin once, run per input (pooled buffers,
 // swappable graph inputs so a trunk's GPU outputs feed straight into perclick — no readback).
 export class Net {
-  constructor(dev, R) { this.dev = dev; this.R = R; this.ext = {}; this.inBuf = {}; }
+  constructor(dev, R) { this.dev = dev; this.R = R; this.ext = {}; this.inBuf = {}; this.convSrc = R.CONV; this.convTM = 4; this.convTN = 4; }
   async load(graphUrl, weightsUrl) {
     const dev = this.dev;
     this.graph = await (await fetch(graphUrl)).json();
@@ -175,7 +213,7 @@ export class Net {
       if (!inSet.has(o.out)) T[o.out] = acquire(this.bytesOf(o.out));   // graph inputs are external (not pooled)
       const r = { op: nd.op, ins: nd.in, out: o.out };
       if (nd.op === 'Conv') { const os = tsr[o.out], is = tsr[nd.in[0]]; const Nvox = os[2] * os[3] * os[4], gx = Math.min(65535, Math.ceil(Nvox / 64));
-        r.bias = nd.bias ? nd.in[2] : null; r.Co = nd.Co; r.u = R.uni([nd.Ci, nd.Co, os[2], os[3], os[4], is[2], is[3], is[4], nd.K, nd.S, nd.pad, gx]); r.wg = [gx, Math.ceil(nd.Co / 64), Math.ceil(Nvox / 64 / gx)]; }
+        r.bias = nd.bias ? nd.in[2] : null; r.Co = nd.Co; r.cs = [nd.Ci, nd.Co, os[2], os[3], os[4], is[2], is[3], is[4], nd.K, nd.S, nd.pad]; r.u = R.uni([nd.Ci, nd.Co, os[2], os[3], os[4], is[2], is[3], is[4], nd.K, nd.S, nd.pad, gx]); r.wg = [gx, Math.ceil(nd.Co / 64), Math.ceil(Nvox / 64 / gx)]; }
       else if (nd.op === 'InstanceNormalization') { const s = tsr[o.out]; const C = s[1], N = s[2] * s[3] * s[4]; r.C = C; r.stats = this.mk(C * 2 * 4); r.u1 = R.uni([C, N]); const gd = R.grid(C * N); r.u2 = R.uni([C, N, gd.gx]); r.wg = gd.wg; r.applyK = o.fused ? R.IN_APPLY_LEAKY : R.IN_APPLY; }
       else if (nd.op === 'LeakyRelu') { const n = this.prod(tsr[o.out]); const gd = R.grid(n); r.u = R.uni([n, gd.gx]); r.wg = gd.wg; }
       else if (nd.op === 'Add') { const n = this.prod(tsr[o.out]); const gd = R.grid(n); r.u = R.uni([n, gd.gx]); r.wg = gd.wg; r.leaky = o.fused; }
@@ -197,7 +235,7 @@ export class Net {
     const B = x => x && x.inp ? this.ext[x.inp] : x, R = this.R, enc = this.dev.createCommandEncoder();
     for (const r of this.recs) {
       const i = r.inB, out = r.outB;
-      if (r.op === 'Conv') R.pass(enc, R.CONV, [B(i[0]), B(i[1]), r.bias ? r.biasB : this.zB(r.Co), out, r.u], r.wg);
+      if (r.op === 'Conv') R.pass(enc, this.convSrc, [B(i[0]), B(i[1]), r.bias ? r.biasB : this.zB(r.Co), out, r.u], r.wg);
       else if (r.op === 'InstanceNormalization') { R.pass(enc, R.IN_STATS, [B(i[0]), r.stats, r.u1], [r.C, 1, 1]); R.pass(enc, r.applyK, [B(i[0]), r.stats, B(i[1]), B(i[2]), out, r.u2], r.wg); }
       else if (r.op === 'LeakyRelu') R.pass(enc, R.LEAKY, [B(i[0]), out, r.u], r.wg);
       else if (r.op === 'Add') R.pass(enc, r.leaky ? R.ADD_LEAKY : R.ADD, [B(i[0]), B(i[1]), out, r.u], r.wg);
@@ -229,6 +267,51 @@ export class Net {
     enc.copyBufferToBuffer(this._maskBuf, 0, rb, 0, n4 * 4); this.dev.queue.submit([enc.finish()]);
     await rb.mapAsync(GPUMapMode.READ); const u = new Uint8Array(rb.getMappedRange().slice(0, N)); rb.unmap();
     return u;
+  }
+  // ---- per-GPU conv autotuning ----
+  setConvConfig(TM, TN) {   // switch every conv record to a (TM,TN) tiling: kernel src + dispatch(gx,wg) + uniform aux
+    this.convTM = TM; this.convTN = TN;
+    this.convSrc = (TM === 4 && TN === 4) ? this.R.CONV : genConv(TM, TN);
+    const tileR = 16 * TM, tileC = 16 * TN;
+    for (const r of this.recs) {
+      if (r.op !== 'Conv') continue;
+      const cs = r.cs, Nvox = cs[2] * cs[3] * cs[4], gx = Math.min(65535, Math.ceil(Nvox / tileC));
+      r.u = this.R.uni([cs[0], cs[1], cs[2], cs[3], cs[4], cs[5], cs[6], cs[7], cs[8], cs[9], cs[10], gx]);
+      r.wg = [gx, Math.ceil(cs[1] / tileR), Math.ceil(Nvox / tileC / gx)];
+    }
+  }
+  // verify candidate configs against the reference CONV on a tiny conv (rejects any buggy tiling); fast.
+  async _verifyConfigs(configs) {
+    const dev = this.dev, R = this.R;
+    const Ci = 8, Co = 20, OD = 9, OH = 9, OW = 9, ID = 9, IH = 9, IW = 9, K = 3, S = 1, pad = 1;
+    const Nin = Ci * ID * IH * IW, Nw = Co * Ci * K * K * K, Nout = Co * OD * OH * OW, Nvox = OD * OH * OW;
+    const rnd = (n, seed) => { const a = new Float32Array(n); let s = seed >>> 0; for (let i = 0; i < n; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; a[i] = s / 0x7fffffff - 0.5; } return a; };
+    const mkb = f => { const b = this.mk(f.length * 2); dev.queue.writeBuffer(b, 0, toF16(f)); return b; };
+    const inB = mkb(rnd(Nin, 1)), wB = mkb(rnd(Nw, 2)), biasB = mkb(rnd(Co, 3)), outB = this.mk(Nout * 2);
+    const readOut = async () => { const rb = dev.createBuffer({ size: Nout * 2, usage: U.MAP_READ | U.COPY_DST }); const e = dev.createCommandEncoder(); e.copyBufferToBuffer(outB, 0, rb, 0, Nout * 2); dev.queue.submit([e.finish()]); await rb.mapAsync(GPUMapMode.READ); const u = new Uint16Array(rb.getMappedRange().slice(0)); rb.unmap(); return fromF16(u); };
+    const runCfg = (src, TM, TN) => { const tileC = 16 * TN, tileR = 16 * TM, gx = Math.min(65535, Math.ceil(Nvox / tileC));
+      const u = R.uni([Ci, Co, OD, OH, OW, ID, IH, IW, K, S, pad, gx]); const wg = [gx, Math.ceil(Co / tileR), Math.ceil(Nvox / tileC / gx)];
+      const e = dev.createCommandEncoder(); R.pass(e, src, [inB, wB, biasB, outB, u], wg); dev.queue.submit([e.finish()]); };
+    runCfg(R.CONV, 4, 4); const ref = await readOut();
+    const ok = [];
+    for (const [TM, TN] of configs) { const src = (TM === 4 && TN === 4) ? R.CONV : genConv(TM, TN);
+      try { runCfg(src, TM, TN); const o = await readOut(); let md = 0; for (let i = 0; i < Nout; i++) { const dd = Math.abs(o[i] - ref[i]); if (dd > md) md = dd; } if (md < 0.05) ok.push([TM, TN]); }
+      catch (e) { /* shader/validation error → drop this config */ } }
+    return ok.length ? ok : [[4, 4]];
+  }
+  // pick the fastest verified conv tiling for THIS gpu by timing the real forward. Inputs must be set. Never regresses.
+  async autotuneConv(candidates = [[4, 4], [2, 8], [8, 2], [2, 4], [4, 2]], reps = 3) {
+    const verified = await this._verifyConfigs(candidates);
+    let best = [4, 4], bestMs = Infinity;
+    for (const [TM, TN] of verified) {
+      this.setConvConfig(TM, TN);
+      this.run(); await this.dev.queue.onSubmittedWorkDone();               // warm (compile pipelines)
+      const t = performance.now(); for (let i = 0; i < reps; i++) this.run(); await this.dev.queue.onSubmittedWorkDone();
+      const ms = (performance.now() - t) / reps;
+      if (ms < bestMs - 0.5) { bestMs = ms; best = [TM, TN]; }               // require a real margin
+    }
+    this.setConvConfig(best[0], best[1]);
+    return { TM: best[0], TN: best[1], ms: Math.round(bestMs), verified: verified.length, tried: candidates.length };
   }
 }
 // argmax(ch1>ch0) over a 2-ch logits buffer -> u8 mask packed 4-per-u32 (avoids fromF16 + JS argmax loop)

@@ -57,6 +57,23 @@ self.onmessage = async (e) => {
       const perclick = new Net(dev, R); await perclick.load(`${base}perclick_${P}.graph.json${qv}`, pcUrl);   // pcUrl is a blob: URL
       trunk.setInputData('img8', new Float32Array(8*N));
       perclick.setInputData('inter', new Float32Array(7*N));
+      // prime the trunk so perclick has real s0/s1 inputs for autotuning
+      trunk.run(); await dev.queue.onSubmittedWorkDone();
+      perclick.setInputBuffer('s0', trunk.outBuf('s0')); perclick.setInputBuffer('s1', trunk.outBuf('s1'));
+      // per-GPU conv autotuning. Cached choice (per GPU, from a prior visit) is applied instantly; else benchmark
+      // if the GPU is fast enough that the one-time tuning cost is small (M4 ~1-2s/fwd, 5090 ~0.3s; skip only truly slow GPUs).
+      const CANDS = [[4,4],[2,8],[8,2],[2,4],[4,2]];
+      let tune = null;
+      if (m.tuneCache && m.tuneCache.TM) {
+        perclick.setConvConfig(m.tuneCache.TM, m.tuneCache.TN); tune = { cached: true, TM: m.tuneCache.TM, TN: m.tuneCache.TN };
+      } else if (m.autotune !== false) {
+        self.postMessage({ type: 'progress', what: 'tune' });
+        const tb = performance.now(); perclick.run(); await dev.queue.onSubmittedWorkDone(); const refMs = performance.now() - tb;
+        try {
+          if (refMs < 2500) tune = await perclick.autotuneConv(CANDS, 2);
+          else { const ok = await perclick._verifyConfigs(CANDS); tune = { skipped: true, refMs: Math.round(refMs), verified: ok.length }; }
+        } catch (e) { tune = { error: String(e && e.message || e) }; perclick.setConvConfig(4, 4); }
+      }
       // warm pass 1 = compiles shaders (slow, one-time); pass 2 = steady-state per-click cost estimate
       let steadyMs = 0;
       for (let w = 0; w < 2; w++) {
@@ -67,7 +84,7 @@ self.onmessage = async (e) => {
         steadyMs = Math.round(performance.now() - tw);
       }
       net = { trunk, perclick };
-      self.postMessage({ type: 'ready', res: P, ms: steadyMs, loadMs: Math.round(performance.now() - t0) });
+      self.postMessage({ type: 'ready', res: P, ms: steadyMs, loadMs: Math.round(performance.now() - t0), tune });
       return;
     }
     if (m.type === 'encode') {                    // {image: Float32Array(P^3) already z-scored}
