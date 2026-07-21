@@ -113,6 +113,8 @@ const ADD = `struct P{n:u32,gx:u32}; @group(0)@binding(0) var<storage,read> a:ar
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
   let i=(wid.y*p.gx+wid.x)*256u+lid.x; if(i>=p.n){return;} y[i]=a[i]+b[i]; }`;
+// fused residual add + LeakyReLU (ResEnc blocks): one pass instead of add-then-leaky, avoids an fp16 round-trip
+const ADD_LEAKY = ADD.replace('y[i]=a[i]+b[i]; }', 'let v=f32(a[i])+f32(b[i]); y[i]=f16(select(v*0.01,v,v>0.0)); }');
 const LEAKY = `struct P{n:u32,gx:u32}; @group(0)@binding(0) var<storage,read> a:array<f16>;
 @group(0)@binding(1) var<storage,read_write> y:array<f16>; @group(0)@binding(2) var<uniform> p:P;
 @compute @workgroup_size(256)
@@ -159,9 +161,9 @@ export class Net {
     const g = this.graph, R = this.R;
     const inSet = new Set(g.inputs.map(i => i.name));
     const cons = {}; for (const nd of g.nodes) for (const i of nd.in) (cons[i] = cons[i] || []).push(nd);
-    const skip = new Set(), fuseOut = {};
-    for (const nd of g.nodes) if (nd.op === 'InstanceNormalization') { const c = cons[nd.out[0]]; if (c && c.length === 1 && c[0].op === 'LeakyRelu') { skip.add(c[0]); fuseOut[nd.out[0]] = c[0].out[0]; } }
-    const ops = []; for (const nd of g.nodes) { if (skip.has(nd)) continue; const fo = nd.op === 'InstanceNormalization' ? fuseOut[nd.out[0]] : undefined; ops.push({ nd, out: fo || nd.out[0], fused: !!fo }); }
+    const skip = new Set(), fuseOut = {};       // fuse a single-consumer LeakyRelu into its InstanceNorm or Add producer
+    for (const nd of g.nodes) if (nd.op === 'InstanceNormalization' || nd.op === 'Add') { const c = cons[nd.out[0]]; if (c && c.length === 1 && c[0].op === 'LeakyRelu') { skip.add(c[0]); fuseOut[nd.out[0]] = c[0].out[0]; } }
+    const ops = []; for (const nd of g.nodes) { if (skip.has(nd)) continue; const fo = (nd.op === 'InstanceNormalization' || nd.op === 'Add') ? fuseOut[nd.out[0]] : undefined; ops.push({ nd, out: fo || nd.out[0], fused: !!fo }); }
     const lastUse = {}; ops.forEach((o, i) => { for (const t of o.nd.in) lastUse[t] = i; });
     g.outputs.forEach(o => lastUse[o.name] = 1e18);
     const T = {}, pool = []; this.zeroBias = {};
@@ -176,7 +178,7 @@ export class Net {
         r.bias = nd.bias ? nd.in[2] : null; r.Co = nd.Co; r.u = R.uni([nd.Ci, nd.Co, os[2], os[3], os[4], is[2], is[3], is[4], nd.K, nd.S, nd.pad, gx]); r.wg = [gx, Math.ceil(nd.Co / 64), Math.ceil(Nvox / 64 / gx)]; }
       else if (nd.op === 'InstanceNormalization') { const s = tsr[o.out]; const C = s[1], N = s[2] * s[3] * s[4]; r.C = C; r.stats = this.mk(C * 2 * 4); r.u1 = R.uni([C, N]); const gd = R.grid(C * N); r.u2 = R.uni([C, N, gd.gx]); r.wg = gd.wg; r.applyK = o.fused ? R.IN_APPLY_LEAKY : R.IN_APPLY; }
       else if (nd.op === 'LeakyRelu') { const n = this.prod(tsr[o.out]); const gd = R.grid(n); r.u = R.uni([n, gd.gx]); r.wg = gd.wg; }
-      else if (nd.op === 'Add') { const n = this.prod(tsr[o.out]); const gd = R.grid(n); r.u = R.uni([n, gd.gx]); r.wg = gd.wg; }
+      else if (nd.op === 'Add') { const n = this.prod(tsr[o.out]); const gd = R.grid(n); r.u = R.uni([n, gd.gx]); r.wg = gd.wg; r.leaky = o.fused; }
       else if (nd.op === 'Concat') { r.parts = nd.in.map(x => this.bytesOf(x)); }
       else if (nd.op === 'AveragePool' || nd.op === 'MaxPool') { const os = tsr[o.out], is = tsr[nd.in[0]]; const Nout = os[1] * os[2] * os[3] * os[4]; const gd = R.grid(Nout); r.u = R.uni([os[1], os[2], os[3], os[4], is[2], is[3], is[4], nd.kernel, nd.S, gd.gx]); r.wg = gd.wg; r.mx = nd.op === 'MaxPool'; }
       else if (nd.op === 'Resize') { const os = tsr[o.out], is = tsr[nd.in[0]]; const Nout = os[1] * os[2] * os[3] * os[4]; const gd = R.grid(Nout); r.u = R.uni([os[1], os[2], os[3], os[4], is[2], is[3], is[4], gd.gx]); r.wg = gd.wg; }
@@ -198,7 +200,7 @@ export class Net {
       if (r.op === 'Conv') R.pass(enc, R.CONV, [B(i[0]), B(i[1]), r.bias ? r.biasB : this.zB(r.Co), out, r.u], r.wg);
       else if (r.op === 'InstanceNormalization') { R.pass(enc, R.IN_STATS, [B(i[0]), r.stats, r.u1], [r.C, 1, 1]); R.pass(enc, r.applyK, [B(i[0]), r.stats, B(i[1]), B(i[2]), out, r.u2], r.wg); }
       else if (r.op === 'LeakyRelu') R.pass(enc, R.LEAKY, [B(i[0]), out, r.u], r.wg);
-      else if (r.op === 'Add') R.pass(enc, R.ADD, [B(i[0]), B(i[1]), out, r.u], r.wg);
+      else if (r.op === 'Add') R.pass(enc, r.leaky ? R.ADD_LEAKY : R.ADD, [B(i[0]), B(i[1]), out, r.u], r.wg);
       else if (r.op === 'Concat') { let off = 0; i.forEach((x, k) => { enc.copyBufferToBuffer(B(x), 0, out, off, r.parts[k]); off += r.parts[k]; }); }
       else if (r.op === 'AveragePool' || r.op === 'MaxPool') R.pass(enc, R.POOL(r.mx), [B(i[0]), out, r.u], r.wg);
       else if (r.op === 'Resize') R.pass(enc, R.RESIZE, [B(i[0]), out, r.u], r.wg);
@@ -249,5 +251,5 @@ export function makeRunner(dev) {
     const bg = dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })) });
     const cp = enc.beginComputePass(); cp.setPipeline(p); cp.setBindGroup(0, bg); cp.dispatchWorkgroups(wg[0], wg[1] || 1, wg[2] || 1); cp.end(); };
   const grid = n => { const nWG = Math.ceil(n / 256), gx = Math.min(65535, nWG); return { gx, wg: [gx, Math.ceil(nWG / gx), 1] }; };
-  return { pipe, uni, pass, grid, CONV, CONV_VSM, IN_STATS, IN_APPLY, IN_APPLY_LEAKY, ADD, LEAKY, POOL, RESIZE, ARGMAX };
+  return { pipe, uni, pass, grid, CONV, CONV_VSM, IN_STATS, IN_APPLY, IN_APPLY_LEAKY, ADD, ADD_LEAKY, LEAKY, POOL, RESIZE, ARGMAX };
 }
